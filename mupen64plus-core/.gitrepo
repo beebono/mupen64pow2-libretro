@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = https://github.com/beebono/mupen64plus-core-dento.git
+	branch = libretro
+	commit = 5eb64b23388a6c7d0fb70c4d26493f4b11038ee0
+	parent = f2ccb6169b3fa5417f12d92321d49bbb43bb3cbd
+	method = merge
+	cmdver = 0.4.9
