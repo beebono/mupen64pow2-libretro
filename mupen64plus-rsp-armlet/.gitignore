@@ -1,0 +1,25 @@
+# build outputs
+/build*/
+/out/
+/work/
+/**/out*/
+
+# test results and ROM-derived data (regenerate locally; see docs/testing.md)
+/test-output/
+
+# editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# tools
+/tools/ucodemap/rspdis
+__pycache__/
+/tools/hle/out/
+
+# generated microcode oracles: tools/rsp2c/rsp2c.py translations and the instruction-level references (ROM-derived; docs/testing.md, "Regenerating the microcode oracles")
+*_gen.inc
+gen_*.inc
+oracle/
+/tools/hle/oracle/

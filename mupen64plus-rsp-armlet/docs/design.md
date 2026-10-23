@@ -1,0 +1,644 @@
+# Design
+
+arMLEt is a Mupen64Plus RSP plugin that puts rsp-hle and parallel-rsp in one module and leaves a hook where native graphics handlers will go.
+This page describes what is there; [testing.md](testing.md) shows that it behaves like the two-module pairing it replaces.
+
+## Why
+
+On the aarch64 handhelds a part of every frame goes to the RSP running the graphics microcode (F3D, F3DEX, F3DEX2 families) in parallel-rsp's
+Lightning JIT, ahead of the RDP plugin ([foir](../../mupen64plus-rdp-foir)). Replacing that with native code (vertex transform and lighting,
+clipping, triangle setup written for NEON) would be much cheaper, but a native version of a ucode has to produce exactly the RDP command
+stream and RSP state the LLE run produces, or be correct enough to accept. That needs a safe place to plug it in, with the JIT as fallback and
+as the bit-exact reference to compare against. arMLEt is that place. With `GfxNative = off` (the default) the plugin is a drop-in for
+`mupen64plus-rsp-hle` + `RspFallback = parallel-rsp`; the routine hook is described under [Native routines](#native-routines).
+
+## Flow of one RSP task
+
+```
+core: DoRspCycles
+  plugin.c            hle_execute(&ctx.hle)                        rsp-hle's task detection (cached per ucode address)
+    audio ABI1/2/3, nead, MusyX, JPEG, video, HVQM, cic x105        run as HLE inside rsp-hle's own code, set TASKDONE|BROKE|HALT
+    graphics task (type 1), any unknown ucode, nead "mats"/"efz"    rsp-hle calls HleForwardTask()          <- hle_glue.c
+      dispatch.c        armlet_gfx_try_native(ctx)                   GfxMode=hle only; false today
+      rdp_defer.c       armlet_rdp_defer_task_begin()                 is it a graphics ucode of a known family? then ProcessRdpList is deferred
+      hle_glue.c        parallelRSPDoRspCycles(~0u)                  parallel-rsp's JIT runs the ucode
+                        (cp0.cpp: SP DMA, the ProcessRdpList callback = rdp_defer.c's, interrupts; the fork's flush hooks)
+      rdp_defer.c       armlet_rdp_defer_task_end()                   nothing may be pending
+  plugin.c            armlet_log_new_handler()                      logs a ucode's HLE handler once per new cache entry
+```
+
+`InitiateRSP` sets `hle_gfx = hle_aud = 0` after `hle_init`. This is the same as the `DisplayListToGraphicsPlugin = False` and
+`AudioListToAudioPlugin = False` that the rsp-hle + parallel-rsp setup used: rsp-hle never sends a list to the core's graphics or audio
+plugin, so every graphics task takes the `unknown_task` path and ends in `HleForwardTask`. rsp-hle needs no change for this, and
+`HleForwardTask` is the single point where a graphics task leaves rsp-hle.
+
+What is shared and what is separate compared with the two-module pairing:
+
+| | rsp-hle + RspFallback | arMLEt |
+|---|---|---|
+| modules | two `.so`, the fallback `dlopen`ed by rsp-hle | one `.so`; parallel-rsp's `parallelRSP*` entry points are called directly |
+| RSP_INFO to parallel-rsp | the core's, unchanged | a copy (`ctx.prsp`), unchanged in the normal module; the profiler build swaps `ProcessRdpList` / `CheckInterrupts` in the copy for timing wrappers, without touching `cp0.cpp` |
+| `PluginStartup` / `Shutdown` of the fallback | called, no-ops in parallel-rsp | none |
+| `RomClosed` | rsp-hle clears its ucode cache, then the fallback's `RomClosed` | the same, plus the ucode-id cache |
+| second `InitiateRSP` in one process | the fallback is unloaded and loaded again (fresh JIT) | the JIT state of the first one stays (the core calls it once per run; a front-end that reuses the process would see a warm JIT) |
+| messages | rsp-hle's, unprefixed | rsp-hle's unchanged; arMLEt's own start with `arMLEt: ` |
+| config | `Rsp-HLE` (`RspFallback` ...) | `Rsp-Armlet`, see [options.md](options.md) |
+
+## RDP list coalescing
+
+A graphics ucode writes `DPC_END` after every chunk of RDP commands it has DMAed to its output buffer, and parallel-rsp calls the video plugin's
+`ProcessRdpList` for each write: 570-1400 calls a frame in Super Mario 64, Banjo-Kazooie and Mario Kart 64, most of them for one 8-byte command, each costing
+0.3-0.7 us of fixed work ([profiling.md](profiling.md#the-rdp-callback-cost-per-call)). `src/rdp_defer.c` replaces the callback in the `RSP_INFO` copy parallel-rsp gets with one
+that records the range and hands the video plugin the concatenation of several lists in one call. It is exact: the video plugin sees the same bytes
+in the same order, the ucode sees the same registers, and nothing that the rest of the machine can observe moves relative to it. Option: `RdpCoalesce`,
+threshold `RdpCoalesceBytes` ([options.md](options.md)).
+
+**What the video plugin does with a list** (foir, `rdp_process_list`): it reads the words from `DPC_CURRENT` to `DPC_END` out of RDRAM (out of DMEM when
+`DPC_STATUS.XBUS` is set), feeds them to the command parser (a command cut by the end of the list carries over to the next call), and then sets
+`DPC_START = DPC_CURRENT = DPC_END`. A list with `end <= current` is ignored, registers untouched. `DPC_CURRENT` is the previous `DPC_END` at every
+call (that is what the last call left), so successive lists are contiguous and their concatenation is one list; the parser is a byte stream, so
+where it is cut does not matter. This argument is about foir (`RdpCoalesce = auto` is on only when the module behind the core's callback is foir; `on` forces it).
+
+**The deferral** (`defer_cb`, called by `cp0.cpp` after it stored `DPC_END`): in a task of a known graphics family it computes what foir would compute
+(`end <= current`: ignore; XBUS: see below), appends `[current, end)` to one pending range `[ps, pe)` and writes `DPC_START = DPC_CURRENT = DPC_END` itself.
+The registers the ucode can read are therefore exactly what they are without deferral, at every instant: `MFC0` of `DPC_START`, `DPC_END`,
+`DPC_CURRENT` needs no hook, and `DPC_STATUS`, `DPC_CLOCK`, `DPC_BUFBUSY`, `DPC_PIPEBUSY` and `DPC_TMEM` are not touched by foir. Running the pending range
+(`run_pending`) sets `DPC_CURRENT = ps`, `DPC_END = pe`, calls the video plugin, and restores the three registers to what they were (equal to what foir leaves
+unless the ucode has moved on, which it cannot, see the triggers).
+
+| trigger | action | why it is needed |
+|---|---|---|
+| `DPC_END` write, range >= `RdpCoalesceBytes` | run the range | bounds the delay; the video plugin's worker threads keep getting work while the ucode runs |
+| `DPC_START` write (`cp0.cpp`, `PRSP_RDP_FLUSH_START`) | run the range before the write | a new buffer (FIFO wrap) resets current and end; the pending range was submitted with the old ones |
+| `DPC_STATUS` write (`PRSP_RDP_FLUSH_STATUS`) | run the range before the write | it can change XBUS (where the list is read from) and FREEZE / FLUSH |
+| `DPC_END` write while `XBUS` is set | run the range, then this list at once | the list is in DMEM, which the ucode overwrites; XBUS lists are never deferred (Mischief Makers uses them for every list; Glover for some) |
+| SP DMA write into RDRAM that overlaps the range (`prsp_rdp_defer_dma_write`, every row, wrapping rows count as overlapping) | run the range before the copy | the ucode overwrites command memory that is still pending (the FIFO is a ring) |
+| the run loop of the task ends (`parallelRSPDoRspCycles`, `PRSP_RDP_FLUSH_RUN_END`) | run the range before the interrupts are checked and `SP_PC` is stored | halt, break, yield, `SET_INTR`, a poll timeout: the task is over for the core, which then looks at `MI_INTR` (the DP interrupt of a `SYNC_FULL`) and at the frame |
+| `armlet_rdp_defer_task_end` | run the range if any | belt and braces after the fork's hook; counted separately, zero in all runs |
+| `DPC_END` write with `end <= current` | nothing | foir ignores it too |
+
+What needs no trigger, and why:
+
+- **Reads of `DPC_START` / `DPC_END` / `DPC_CURRENT` / `DPC_STATUS`** (polling for the RDP to drain, buffer-full handling): the registers hold what foir would have left, and
+  foir never changes `DPC_STATUS`. A ucode that waits for the RDP to finish sees it finished at once, as without deferral (foir's call is synchronous).
+- **`SYNC_FULL` and the DP interrupt**: foir raises `MI_INTR_DP` and calls `CheckInterrupts` while it parses the list that holds the sync. `CheckInterrupts` is a no-op in
+  the core's RSP and graphics `INFO`; the core looks at `MI_INTR_DP` after `DoRspCycles` returns (`do_SP_Task`), and `MI_INTR_SP` is only raised by the core after that. Nothing reads
+  `MI_INTR` in between (the RSP cannot), so running the sync at the end of the run loop instead of in the middle changes nothing the core can see. The deferred range always runs
+  before the run loop's own `CheckInterrupts` call and before `DoRspCycles` returns.
+- **`RomClosed`, state saves**: a state is saved by the core between tasks, and nothing is pending between tasks. `RomClosed` forgets a (never present) range.
+- **The order of the RDP's work against the ucode's other effects**: the RDP reads and writes RDRAM (textures, the frame buffer, Z); the RSP's DMA reads and writes touch RDRAM too. A deferred
+  list sees RDRAM as it is at the flush, so the argument needs that no RSP DMA changes anything the pending lists read or write, and that no RSP DMA read sees what pending lists
+  would have written. The DMA-write case that is certain, the output buffer itself, is the overlap trigger. For the rest the module relies on what the ucodes do: it defers only in tasks whose
+  ucode text carries an `F3D` / `F3DEX` / `F3DEX2` family banner (`gfx_ucode.c`; Worms and other ucodes without one are passed through, except Diddy Kong Racing, Jet Force Gemini and Indiana Jones in `GfxMode = hle`, whose microcodes have a task-level front-end: [native-custom.md](native-custom.md)). Those ucodes
+  write RDRAM only for the output buffer, the yield area and a few small blocks (Banjo-Kazooie and Banjo-Tooie write 0x48 to 0x1b0 bytes at low addresses, a few times per task), and read
+  display lists, vertices and matrices, not what the RDP rendered. This is an assumption about the ucode, not something the module checks. What backs it: in the survey of
+  [testing.md](testing.md) (63 ROMs, `RdpCoalesceBytes` at the default and at its maximum of 1 MiB) all of RDRAM, hashed after every `DoRspCycles`, is identical with and without coalescing (three games whose RDRAM is not deterministic even without it show no difference in everything else).
+
+The fork changes are behind `PRSP_RDP_DEFER` (`ext/parallel-rsp/prsp_rdp_defer.h`, branch `rdp-defer`): four call sites in `rsp/cp0.cpp` and `parallel.cpp`, empty macros when the
+define is absent, so the default fork build is byte-identical ([testing.md](testing.md)). The module defines the two hook functions.
+
+## Native routines
+
+Native routines replace stretches of a graphics microcode (a vertex transform, a triangle setup) with C / NEON code that works on the RSP state, while the JIT
+keeps running everything around them and stays the reference. The interface, with the exactness contract, is `src/native/native.h`; the framework is
+`src/native/native.c`; the hook in the fork is `ext/parallel-rsp/prsp_native.h` (`-DPRSP_NATIVE`, the fork's `native-hook` branch). Nothing of this runs unless
+`GfxNative` is `on` or `verify` ([options.md](options.md)).
+
+**The hook (fork).** The JIT enters a block through `blocks[pc]`, and the enter thunk looks that table up inline; only a block that is not compiled yet goes
+through `get_jit_block`. The hook lives on that miss path, so a block that has no routine costs nothing:
+
+- the host declares *entry* pcs (the first instruction of a routine) and *split* pcs (entries and static exits). On a miss at an entry pc `get_jit_block` asks the
+  host's `lookup(pc, imem)`: does a routine apply to the IMEM content as it is now? If so `blocks[pc]` gets a *stub*, a few instructions that call a thunk
+  (`native_thunk`, next to the enter and return thunks), instead of a compiled region. The thunk calls `CPU::native_enter`, which returns the block to continue in:
+  the one at the pc the host returns after running the routine, or, if the host declines (or a delay slot is pending: a stub is entered at a block boundary
+  only), the JIT's own region for the entry pc, compiled on demand.
+- A compiled region never extends across a split pc (the region ends before it and continues through the enter thunk). Without this a `j` or a fall-through
+  inside a region would reach the entry without going through `blocks[]`, and the JIT could not be stopped at an exit either.
+- The match is keyed on **content**. The stub sits in `blocks[]` like any region, so SP DMA that changes the code removes it (the existing 256-byte-block
+  invalidation), and `invalidate_code()` also removes a stub when a changed block overlaps `[dep_lo, dep_hi)` of its match (what the host's decision depended
+  on, beyond the region the JIT would compile). The next entry looks up again. The host decides on (ucode id, entry pc, FNV-1a-64 of IMEM
+  `[dep_lo, dep_hi)` followed by `[dep2_lo, dep2_hi)`, or of `hash_ranges` when the code is spread over more places): `struct armlet_routine`. A match carries two ranges; a changed
+  block that overlaps neither (the overlay window between them) leaves the stub alone.
+- The *oracle*: `prsp_native_oracle(entry, stop)` runs the JIT's own code from an entry until it is about to execute `stop`, nested inside the host's `enter`
+  (`enter_frame` is re-entrant: it is the C-callable entry of the thunks). Stubs decline meanwhile; the entry pc runs the JIT region, `stop` has a one-instruction
+  block that returns `MODE_NATIVE_STOP`. A `CHECK_FLAGS` return (SP DMA into IMEM that changed code) is handled as `run_rsp_task` does: invalidate and go on,
+  unless an interrupt or a halt ends the task.
+- `prsp_native_record(1)`: `RSP_MTC0` and the DMA code emit an event for every effectful SP register write (DMA read, DMA write with an FNV hash of the bytes
+  written to RDRAM, SP_STATUS, semaphore, DPC_START, DPC_END with a hash of the list bytes, DPC_STATUS), whether the JIT or the host caused it.
+  `prsp_native_sandbox(1)`: SP DMA writes to RDRAM are done but their old bytes kept (put back by `sandbox(0)`), the RDP is not run (no `ProcessRdpList`, no
+  deferral flush). `prsp_native_save/load` copy all RSP state (GPRs, vector registers, accumulator, flags, divide unit, DMEM, IMEM, SP/DPC registers, interrupt flag,
+  the status-poll counters, the JIT pc and delay-slot state) to and from a `PrspNativeSnap`.
+
+With `PRSP_NATIVE` undefined the fork compiles to the same object code as before (md5s of every object and the `.so` are identical to the base commit; [testing.md](testing.md)).
+
+**The routine.** `int run(struct armlet_env *e)`: `e->rsp` is a view of the JIT's state (GPRs, vector registers, accumulator, flags, divide unit, DMEM words, IMEM), the
+return value is the pc to continue at, or `ARMLET_NATIVE_DECLINE` with the state untouched. The routine never touches RDRAM or the RDP: `armlet_mtc0`, `armlet_mfc0`,
+`armlet_dma_read` and `armlet_dma_write` do what the microcode's `mtc0` / `mfc0` sequences do (the fork's own DMA code, the same RDP-list path with its
+coalescing), so verify mode can sandbox them. Routines register themselves with `ARMLET_ROUTINE(x) = { ... }` into the section `armlet_routines`; a family adds one
+file under `src/native/` and touches nothing shared.
+
+**The exactness contract.** When a routine returns the pc P, the machine is what the microcode run from the entry up to its first arrival at P leaves:
+
+| state | compared |
+|---|---|
+| GPRs `sr[1..31]`, vector registers `vr[0..31]`, accumulator (HI, MD, LO), VCO / VCC / VCE, `div_out` / `div_in` / `dp_flag` | all, unless the routine declares them dead (below) |
+| DMEM, IMEM | all 4 KiB each |
+| the SP / DPC registers | final values (the DPC registers are the video plugin's once a list was submitted: compared through the events) |
+| the effectful SP register writes | the same sequence: DMA reads (addresses, length register), DMA writes (and the hash of the bytes written to RDRAM), DPC_START / DPC_END (and the hash of the list), SP_STATUS, semaphore |
+| the status-poll counters (`MFC0` of SP_STATUS), `SP_STATUS_TIMEOUT`, the interrupt flag, IMEM dirty bits (if neither side did IMEM DMA) | equal |
+| the exit pc, no delay slot pending | equal |
+
+A routine may declare live-out masks (`dead_sr`, `dead_vr`, `dead_acc`, `dead_flags`, `dead_div`, and the lane-granular `dead_vr_lanes[n]` / `dead_flag_lanes[k]` /
+`dead_acc_lanes[k]`): state that the microcode after the routine's exits never reads (or overwrites before reading), so that the native routine need not compute it. Verify
+excludes exactly these; `ARMLET_NATIVE_POISON=1` overwrites them (only the dead lanes) with a pattern after the routine, so that a wrong claim shows up downstream. The
+default, and the goal, is full equality.
+
+**How a mask is established, and what is not enough.** A static liveness listing (`tools/native/liveness.py`) cannot establish a mask: an indirect jump has more targets
+than any run shows, and partial writes (a load of 8 bytes) make nearly every register look live. A mask that passed verify (which only compares what is not masked) and a
+static check has failed the RSP hash-stream equivalence in practice (a first F3D claim diverged at the 580th task). The rule: a claim is **probed**, then **validated**.
+Probing: an oracle-only routine (`run = NULL`, below) with `ARMLET_NATIVE_PROBE="sr=0x..,vr=0x..,vl<n>=<lane mask>,acc,vco,vcc,vce,fl<k>=<bit mask>,div"` runs the JIT as always and
+poisons the named state after the stretch; the claim holds for a run if the RSP hash stream, state stream, screenshots and audio of `tools/equiv` stay identical to the
+reference (`ARMLET_NATIVE_POISON=1` does the same for the declared masks of a native routine). Validated: the masks of a routine are kept only if the POISON runs of all the
+games the routine targets, and the verify runs on devices, are identical; and the routine's file says how they were established and over which runs.
+
+**Oracle-only routines** (`run = NULL`): the framework runs the JIT from the entry to `exit_pcs[0]` and does nothing else but what the environment asks: snapshots
+(`ARMLET_NATIVE_CAPTURE`), probing (`ARMLET_NATIVE_PROBE`). They are how entry snapshots of a routine are taken before it exists natively, and how its live-out is found.
+Their names start with `cap.` and they are selected only when named.
+
+**Verify mode** (`GfxNative=verify`, for tests): at every entry the framework saves the state, runs the routine in the sandbox with recording on, puts the
+state and RDRAM back, runs the JIT's code to the routine's exit with recording on (this is the run that stands: the machine always continues from the JIT's
+result), saves, and compares. The first differences are reported with their values (`native %s MISMATCH`, the registers, vector lanes, DMEM words, the
+first differing SP write); `ARMLET_NATIVE_ABORT=1` aborts at the first one, `ARMLET_NATIVE_CAPTURE=<dir>` writes snapshot files of entries (and of mismatches).
+A routine that declines must leave the state as it found it: verify checks that too. If the JIT run does not arrive at the pc the routine returned (a wrong exit)
+that is a mismatch as well.
+
+**Offline harness** (`tools/native/replay.c`, `scripts/build.sh <target> --tools` -> `armlet-native-replay`): a snapshot file holds the entry state (`PrspNativeSnap`: RSP state, DMEM,
+IMEM), the RDRAM rows the routine's DMA reads read, and the state and effect log the JIT left. The program loads it into a private RSP (the fork's `JIT::CPU`, private RDRAM)
+and runs the same verify as the module does, then checks that the JIT's result still equals the recorded one. `--bench N` times the routine and the JIT's code for the same
+stretch from the snapshot, N times each. Snapshots come from any run with `ARMLET_NATIVE_CAPTURE=<dir>` and are ROM-derived: keep them in the git-ignored `test-output/`.
+
+**Selection.** Each graphics task identifies its ucode as before (`gfx_ucode.c`); when the id changes, the routines of that ucode that the allow-list admits
+(`GfxNativeRoutines`) are selected and their entry and exit pcs given to the fork (which drops its compiled blocks only if the sets changed). A routine named
+`test.*` is only selected when the allow-list names it. DMEM data that a routine relies on being constant is the routine's business: it reads it from DMEM per
+call, or checks it (ucode id and IMEM content identify the code, not the data segment).
+
+## Profiler
+
+`src/prof/` is compiled only with `-DARMLET_PROFILE` (`scripts/build.sh <target> --prof`, a separate `.so`); the normal module contains none of it and is
+byte-identical to a build of the tree without it. It measures where the graphics time goes: per task (type, ucode id), the JIT address map
+and, with `--prof3`, how often every instruction of the ucode ran. It watches parallel-rsp through `ext/parallel-rsp/prsp_hooks.h`: `PRSP_HOOK_*`
+macros at region compilation (code address, size and the code offset of every instruction), VU stub and thunk creation, block lookup and
+compile time, IMEM invalidation, SP DMA, and the per-instruction counter, which expand to nothing unless `PRSP_HOOKS` is defined. Method and
+results: [profiling.md](profiling.md).
+
+## Source layout and build
+
+`src/plugin.c` is the six API functions. `config.c` follows rsp-hle's lookup of the core's config API through `dlsym` and keeps the section
+version handling. `hle_glue.c` is what rsp-hle's `plugin.c` provided (message and callback forwards, `HleForwardTask`) plus the handler log. `dispatch.c` and
+`gfx_ucode.c` are the native-path hook. `log.c` routes messages to the core's debug callback (and to `ARMLET_LOGFILE`).
+
+One CMake target links arMLEt's files, rsp-hle's 13 C files (as upstream's Makefile builds them: `-O3 -DNDEBUG -ffast-math`, hidden visibility,
+`-Wall`; no `plugin.c`, no osal) and the 11 parallel-rsp C++ files + `parallel.cpp` (C++14, `-O3 -ffast-math`, the fork's warning flags,
+`PARALLEL_INTEGRATION M64P_PLUGIN_API PARALLEL_RSP_LIGHTNING`) with Lightning as a static library. Points that are easy to get wrong:
+
+- `rsp/vu_inline.cpp` is compiled with `-ffixed-x9..x15,x18,x20..x28` on aarch64, the same string as the fork: the VU op bodies the JIT copies into
+  its code must not touch an integer register the JIT keeps live. The property is set in the top-level CMakeLists (source file properties are
+  directory-scoped).
+- No `-flto` (it does not mix with the `-ffixed-*` file) and no `-mcpu` / `-march`: generic armv8-a, as measured for the other plugins.
+- Include directories are per language. rsp-hle has headers called `memory.h`, `common.h` and `audio.h`, which would shadow system or parallel-rsp
+  headers for the C++ side if they were global.
+- `-Wl,--version-script=src/armlet_api_export.ver -Wl,-Bsymbolic -Wl,--exclude-libs,ALL`: the module exports exactly `PluginStartup`,
+  `PluginShutdown`, `PluginGetVersion`, `DoRspCycles`, `InitiateRSP`, `RomClosed`. Lightning's `_emit_*` and parallel-rsp's `parallelRSP*` stay private
+  (a symbol clash with another plugin, or with the fallback copy of parallel-rsp, cannot happen).
+- `cmake/check_sources.cmake` fails the configure step if parallel-rsp's `PARALLEL_RSP_SOURCES` (or its plugin target) or rsp-hle's `SOURCE` list
+  differs from `cmake/prsp_sources.cmake` / `hle_sources.cmake`, so a submodule update cannot silently drop a translation unit.
+
+The rsp-hle asserts are compiled out (`-DNDEBUG`), as in upstream's release build. A failed assert would otherwise abort the emulator.
+
+## Graphics ucode identification
+
+`gfx_ucode.c` identifies the microcode of a task by hashing its text: FNV-1a-64, one 32-bit host-endian RDRAM word per step, over
+**the whole 4 KiB at `TASK_UCODE`, whatever `ucode_size` says**. (Games pass 0, 0xf80 or 0x1000 for one text: the boot code loads 0xf80 bytes and the
+microcode loads the tail itself. Until 2026-10-16 the hash covered `ucode_size` bytes, so one text had up to three ids: Rocket's F3DEX 2.07 and Donkey Kong 64's
+were the same 4 KiB under two ids, 5 of the 58 ids of the survey were such duplicates, and registering a text meant registering it per size; [ucode-survey.md](ucode-survey.md).) rsp-hle's own cache is keyed on the ucode's *address* and says nothing about what is at that address, so it
+is not trusted for this. The id is recomputed only when the text changed: four recent texts are kept and compared with `memcmp`
+(vectorised in libc) against RDRAM first. The hash itself is a serial multiply chain and has no NEON form; there is a scalar reference only
+(`armlet_ucode_hash`).
+
+The first time an id is seen, one line is logged, with the family (`F3D`, `F3DEX`, `F3DEX2`, from the "RSP Gfx ucode ..." banner strings
+read from the ucode text and data at run time) and whether a handler exists:
+
+```
+arMLEt: gfx ucode 0d3f849c8dd309c4 F3DEX2: RSP Gfx ucode F3DZEX.NoN fifo 2.06H Yoshitaka Yasumoto 1998 Nintendo. | ... [no native handler, LLE]
+```
+
+This is computed only in `GfxMode = hle` (the default). With `lle` a graphics task goes straight to the JIT with no hashing.
+
+Offline companions: [ucode-survey.md](ucode-survey.md) (which texts exist and how close they are), [ucode-coverage.md](ucode-coverage.md) (how many graphics tasks and how much RSP time of 64 games run native today, and the ranked list of what is left) and
+[ucode-derive.md](ucode-derive.md) (`tools/derive_build.py`: derives the build record of an unregistered text from the registered builds and lists what it cannot explain; validated against the hand-written records).
+
+## Task-level native path
+
+A graphics task of a ucode that has an `hle_ucode` entry (`src/hle/hle.h`; `GfxMode=hle`, optionally restricted by `GfxHleUcodes`) is run by `armlet_hle_run` (`src/hle/hle_core.c`) instead of
+by the JIT; the JIT stays the reference and the fallback. Nothing of this runs with `GfxMode=lle` (the default is `hle`), and it needs the video plugin to be foir behind the coalescing path
+(`RdpCoalesce` resolved on), because the commit replays the RDP lists through that path.
+
+**Structure.** A *family* (`struct hle_family`) has a `run(task, ucode)`; a *build* of a microcode is data (`struct hle_ucode`, registered with `HLE_UCODE()` into the section `hle_ucodes`,
+found by the ucode id): the layout offsets, flags, the variants within the family (`vtx_variant`, `tri_variant`, `clip_variant`), the family's own constants (`fam_data`), and the DMEM ranges
+that are dead at the end of a task. The shared library is the fixed-point arithmetic of the RSP as plain integer functions (`hle_fx.h`; the closed forms and their test,
+`tools/hle/prim_test.c`, are Fleet B's: 0 failures over 200 000 trials x 8 lanes against the exact VU instruction sequences, and a mutation check) and the task framework. F3DEX2 is the first
+family (`hle_f3dex2.c`): its four builds (Donkey Kong 64, Paper Mario, Ocarina of Time, Pokemon Snap) are tables, and its `run()` is the native front-end described under "The F3DEX2 front-end" below; the interpreter below is its exact reference.
+The F3DEX 1.x front-end (`f3dex.c`) is data-driven the same way (since 2026-10-17): a build is `struct f3dex1_build` (`f3dex_bld.h`: the DMEM layout, the handler pcs, the reject mask, the NoN / LX / G_CULLDL
+variants), the commands go through the build's own handler tables in DMEM, and nothing tests which build it is ([native-f3dex.md](native-f3dex.md) section 3). So is the F3D front-end (`f3d.c`): a build is
+`struct f3d_build` (`f3d_bld.h`: the DMEM layout with G_VTX's return slot, the handler pcs with the loop head and the exit BREAK, the reject / clip / G_CULLDL masks, the attributes for Pilotwings' clip flag
+word, Wave Race's G_VTX / loop / triangle code and index scale, G_POPMTX's stale flag and XBUS), the opcodes reach their command through the build's tables ([ucode-f3d.md](ucode-f3d.md) section 15).
+GoldenEye 007's 2.0G text is registered that way, with its four-triangle command (G_TRI4, op 0xb1) as one more command of the front-end.
+
+**What a family must produce.** Only what can be observed afterwards: the RDRAM the task writes, the concatenated RDP command stream, the SP / DPC / MI registers, the OSTask words the ucode writes, and
+DMEM except the ranges the build's table declares dead. The vector unit, the scalar registers, the accumulator and the flags are not part of it (the next task loads them before use). A family
+therefore does not have to imitate the microcode's internal structure (its RDP output buffers, its vertex slot records) except where a later task, or the microcode's own next command, reads it.
+
+**The run.** `armlet_hle_run` saves the RSP state (`prsp_native_save`), zeroes the status-poll counters (the JIT does at the start of a task), switches the fork's sandbox on (SP DMA writes
+to RDRAM keep their old bytes, the RDP is not run) and calls the family. The family works on the real DMEM / IMEM / RDRAM and the SP / DPC registers through `hle_dma_read`,
+`hle_dma_read`, `hle_dma_write`, `hle_mtc0`, `hle_poll_status` (the fork's own DMA and register code, so the registers, IMEM dirty bits and events come out as the JIT's), and, for a front-end that does not need the
+fork's DMA for a write to RDRAM, `hle_rdram_write` (the same effect on the log, the sandbox and the compare at a quarter of the cost: the fork's sandbox allocates an undo record for every DMA row; this one keeps its own, applied when the sandbox goes off). The DMA writes and the DPC
+register writes are logged. When the family returns `HLE_OK` the task is complete; `HLE_DECLINE` (`hle_decline(task, "why")`) gives the whole task to the JIT: the state is loaded back and
+the RDRAM restored, so nothing is split. At the commit the sandbox is switched off (RDRAM back to its state at the task start), then the log is replayed in order through
+`prsp_rdp_defer_dma_write` / `prsp_native_mtc0`, which is exactly the call sequence of a JIT run, so the video plugin and the RDRAM end identical. `SP_PC`, `SP_STATUS` (BROKE | HALT, the
+SP interrupt) are what `BREAK` and the run loop leave.
+
+**The interpreter (`hle_rsp.cpp`).** A small RSP interpreter over the real memories: the scalar unit in plain code, the vector unit and the vector loads / stores through the fork's per-instruction
+helpers (the JIT's helper-call path; `tools/native/trace.cpp` uses the same ones), MFC0 / MTC0 through the framework. It is the exact reference of the task-level path: a family with no native code
+runs on it (`ARMLET_HLE_INTERP=1` forces it for any family), `ARMLET_HLE_VERIFY=interp` compares a native front-end with it, the offline harness replays captured tasks with it, and the F3DEX2 front-end uses it for the
+boot code (about 140 instructions up to the first fetch of the command loop) and for the end of the task (about 70). It reproduces all captured tasks of the four games (570 tasks of Donkey Kong 64, Ocarina of Time, Paper Mario, Pokemon Snap). It is slower than the JIT (about 3x on a Donkey
+Kong 64 task on the x86 desktop; on the A55 about 80 ns per interpreted instruction against the JIT's 11 ns) and is not a production path. Earlier work on *hooks* inside the interpreter (native handlers taking over at a pc) and on the JIT running the
+stretches between them was dropped in favour of whole-task native front-ends (see below); the hook code is not part of the tree.
+
+**What verify compares** (`ARMLET_HLE_VERIFY=1` or `jit`: the oracle is the JIT; `=interp`: the oracle is the interpreter, and the JIT then runs the task for real; and the offline harness): the
+native run in the sandbox, then the state is put back and the oracle runs the task; then native against oracle. Two modes, the same for every family (nothing is set per ucode):
+
+- **External effects (the default; the measure is the result, not what happens in between).** All of DMEM except the ucode's declared dead ranges, IMEM, the SP / DPC registers, MI_INTR (without the DP
+  interrupt bit, which the RDP raises when it processes a full sync), the pc, `SP_STATUS_TIMEOUT`, the RDRAM the task wrote by SP DMA (the bytes of every range either side wrote, except the RDP output
+  ring: below), and **the bytes of the RDP lists as one stream** (FNV-1a-64 and length of all list bytes in order, parsed across list boundaries like foir's parser, with the second word of NO_OP and the sync
+  commands zeroed: the RDP ignores it and the microcode leaves stale scratch there). Not compared: the order and number of the intermediate SP register writes, the DMA chunking, the poll counts, the IMEM
+  dirty bits, list boundaries (unobservable to foir; coalescing already relies on it), the scalar and vector registers, the accumulator, flags and divide unit (`ARMLET_HLE_POISON=1` fills them with a pattern
+  after a native task so that a wrong claim shows up in the equivalence runs), the status-poll counters (the JIT zeroes them at every task start).
+- **Exact events (`ARMLET_HLE_EXACT=1`).** The above plus the sequence of recorded SP register writes (DMA reads and writes with the hash of the bytes, status, semaphore, DPC_START / END / STATUS) and the
+  IMEM dirty bits (the oracle's must be a subset). A front-end that claims to do what the microcode does, DMA for DMA, can be held to it, and in this mode it has to be: a front-end checks `hle_exact()` and
+  does every DMA and every IMEM load the microcode does (the F3DEX2 front-end does; its replay of the 582 captured tasks is equal in both modes on the desktop and on both devices).
+
+**The RDP output ring is a mask in RDRAM.** The ucode's OSTask names the ring (`hle_ucode.ring_off`: the DMEM address of the two words, start and end; 0xfe8 on F3DEX2). The RDP lists are written there and
+taken by the video plugin; nothing reads the ring afterwards, and what a native run leaves in it differs from the JIT's in the stale second words of the sync commands (the stream compare zeroes them) and in
+whatever scratch a chunk starts or ends in. The compare skips the DMA chunks inside the ring (their bytes are compared through the stream); `ARMLET_DMEM_POISON=ring` overwrites the whole ring with a pseudo-random pattern after
+every graphics task (the lists have been taken by then) as the proof, like the poison of a DMEM mask.
+
+**DMEM masks.** A build may declare DMEM ranges dead at the end of a task (`hle_dead_range`: scratch the next task overwrites before reading, or never reads). A mask is data in the build's table, cites
+how it was established, is applied identically by the verify compare, the poison probe and the `tools/equiv` hash (`armlet_hle_print_masks` feeds the shim), is validated by the equivalence runs
+of all the target games on both devices, and never covers RDP lists, the output FIFO state, the DL stack or anything the RDP or a later task reads. **The evidence is per family**: the F3D family
+leaves DMEM dead except the OSTask header (Fleet C's poison runs), F3DEX 1.x does not reload DMEM 0x800-0xfbf between tasks; each family's mask needs its own proof.
+The probe is `ARMLET_DMEM_POISON=<lo>-<hi> | mask | all | ring` (a comma separated list of any of them; `hle_task.c`): at the end of every graphics task, whether the JIT or the task-level path ran it, those DMEM bytes are overwritten with a
+pseudo-random pattern (a different one each time); `mask` is the build's dead ranges, `all` is [0, 0xfc0). A range is dead when a run with it poisoned gives the events, the RDP stream, the
+pictures and the audio of the unpoisoned run (docs/testing.md).
+
+**Capture and offline replay.** `ARMLET_HLE_CAPTURE=<dir>` (with `_EVERY`, `_MAX`) writes snapshot files of task starts (state, the RDRAM rows the task's DMA reads read, the JIT's end state,
+the recorded events and the JIT's RDP stream) for tasks the JIT runs; `armlet-native-replay file.snap...` runs the family on them and compares with the recorded JIT result (the rows of RDRAM that the task's DMA reads read are copied when the DMA happens: the task's own flush can overwrite them; `HLE_PATCH=addr:hex;...` writes RDRAM before the run, for the synthetic tasks of `tools/hle/mksyn_ex2.py`, docs/testing.md)
+(`--bench N` times the front-end and the JIT; `HLE_POKE=addr=val,...` sets DMEM bytes first). Snapshots are ROM-derived: keep them in `test-output/`.
+
+**The F3DEX2 front-end** (`hle_f3dex2.c`, `f3dex2_fx.[ch]`, `f3dex2_fx_neon.c`, `f3dex2_dmem.h`; the microcode's behaviour is written down in [ucode-f3dex2.md](ucode-f3dex2.md)). `run()` lets the interpreter run the
+microcode's boot code up to the first fetch of the command loop, takes over there with a C loop over the display list, and hands the end of the task (the outermost `G_ENDDL`) back to the interpreter, whose
+exit code flushes the RDP buffer and ends the task. Anything the loop does not know (`G_LOAD_UCODE` of a text that is no registered build, `G_DMA_IO`, a yield, a vertex count over 32, an unknown overlay, more than 30 000 SP_STATUS polls, a state in
+which the microcode would wait for the RDP) declines the whole task. DMEM stays the home of the microcode's state (the matrices, the lights, the vertex records, the geometry mode, the display list stack, the segment
+table, the RDP output buffers), so the interpreter's exit code finds what it expects and the compare can check the state itself. The commands are plain C; the geometry is a set of functions over structs that
+know nothing of DMEM addresses or pcs (`f3dex2_fx.h`, after Fleet C's `f3d_fx.h`): `fx2_mtx_mul`, `fx2_light_setup`, `fx2_vtx_xform` (n vertices: lighting, texture generation, fog, the clip flags with the pair
+merging and the phantom partner of an odd count), `fx2_tri_setup` (the decisions and the RDP triangle command), `fx2_clip_tri` (the six-plane clipper with the new vertices completed by the vertex
+pipeline); `f3dex2_dmem.h` fills the structs from DMEM and writes them back. Each has a scalar form (`_scalar`, plain C11, the reference, checked against the interpreter running the microcode on every captured
+task and in the equivalence runs) and on aarch64 a NEON form with identical results (`tools/hle/test_fx2.c`: 400 000 random triangles, 40 000 vertex batches and 100 000 matrix products bit for bit, with deliberate
+errors in the NEON forms, `-DFX2_NEON_MUTATE=n`, caught). `HLE_FX2_SCALAR=1` selects the scalar forms at run time (A/B timing on a device).
+
+The **lean mode** (default; `ARMLET_HLE_EXACT=1` turns it off) does only the SP DMA and IMEM loads that the external effects need: the display list is read from RDRAM instead of through the 168-byte refills, the input
+vertices from RDRAM instead of through a DMA to the slots (the 40-byte records written over them cover the range), the matrices, lights and viewport are copied, the RDP buffer is written to the ring with
+`hle_rdram_write`, the lighting and clipping overlays are tracked and the one that the microcode would have left is loaded once at the end. The decisions that the microcode makes per chunk (where the ring wraps, whether the RDP
+would have to catch up) are still made chunk by chunk, so DPC_START / END and the FIFO pointer end where the microcode's do. The ranges that this leaves different from the JIT's are the F3DEX2 table's
+(`f3dex2_dead_out`, below).
+
+**The F3DEX2 table of dead ranges** (cited where it is declared): the display list input buffer 0x920 .. 0x9c8 (the last refill), the clipper's polygon lists 0x3ca .. 0x408 and new vertices 0x9c8 .. 0xba8, the RDP output buffers
+and their slack up to 0xfb8, the padding byte of each colour / direction of the light slots, and the word at 0xfc8 (OSTask.ucode_boot: the initialisation stores register a0 there, `sw a0, 0xfc8`, which holds what the
+previous task left in it; found because the equivalence run of a native-run Ocarina of Time diverged in its RSP hash from the second graphics task on). The microcode reloads DMEM from the ucode data at the start of every task, so
+the whole [0, 0xfc0) is dead across tasks (`ARMLET_DMEM_POISON=all` leaves the state stream, the pictures and the audio of the games identical); the table is deliberately smaller than that so that the compare keeps checking
+the state a native front-end computes and the interpreter does not need to reproduce.
+
+**Input no game produces: what the front-ends decline.** The lean mode and the closed forms model the microcode on the display lists, vertices and matrices a game writes. A perturbed task (`tools/rsp2c/fuzz_snaps.py`,
+docs/testing.md, "Fuzzing the front-ends") reaches states the microcode handles in its own way, which the front-ends do not reproduce; each of these is detected where the command is handled (a compare or two) and the whole task
+goes to the JIT. A mutation number (`MUT(n, ...)`, `scripts/build.sh native --tools --hmut=n`) switches each one off for the check:
+
+| decline | why it cannot be modelled | n |
+|---|---|---|
+| a vertex number past the 32 slots or odd (`G_TRI1/2/4`, `G_QUAD`, `G_MODIFYVTX`, `G_CULLDL`, `G_BRANCH_Z`); a `G_VTX` whose end index is past 32 / odd / below 2n / has bits 20 .. 23 set; a `G_MODIFYVTX` field past the record | the table lookup reads the clipper's constants (F3DEX 1.x: the vertex staging area, which the lean mode does not fill) and stores go anywhere | 217, 218, 221, 222, 223; 471, 472 (F3DEX 1.x `G_MODIFYVTX`, `G_BRANCH_Z`) |
+| `G_MOVEMEM` / `G_OBJ_MOVEMEM` to IMEM (bit 12), over the display list buffer, the jump table, the overlay descriptors, the segment table, the display list stack or the FIFO pointer; an index past the table; `G_MOVEWORD` with an index past the table or an offset that is not a word within its group (segments up to 0x3c, lights up to 0x1fc) | stores the front-end does not keep (the lean mode reads the list from RDRAM; the opcode classification is cached from the jump table) | 219, 231, 235, 237, 238 |
+| `G_SELECT_DL` whose flags word (DMEM `0x2b0` + byte 0 of w0) lies over the jump table, the overlay descriptors, the input buffer, the segment table or the FIFO pointer (`f3_store_unmodelled`); a game's are the first few words | the microcode stores the word where it is told: over opcode 0's jump table entry it turns the no-op from the sync handler into the loop head, and the opcode classification the loop cached from the table is stale (the front-end then wrote a no-op word per zero command, the JIT nothing) | 315 |
+| an opcode whose jump table entry is 0 (which is `G_DL`'s pc) or the sync handler and is not `G_DL` / a sync (Conker's 0x09 .. 0x0f) | undefined opcodes: the sync copy leaves a stale second word | 225, 226 |
+| a geometry mode bit the build gives no meaning to; a texture on byte other than 0 / 2 or a tile byte past 6 bits; a guard-band ratio with bit 15; `G_MTX` with a length other than 64 bytes (F3D / F3DEX: shorter than a matrix) | the cull table is indexed by bits 8 .. 15, the command id takes the low byte, the ratio is a signed lane, a short DMA leaves the rest of the matrix as the geometry buffer was | 224, 230, 232, 233, 229, 239 |
+| a class-0 operand longer than the buffer's dead range (F3D 0x150 bytes at SM64's layout, F3DEX 0x200) | the DMA runs on into live DMEM | 227, 236 |
+| a triangle or `G_CULLDL` over the partner slot of an odd `G_VTX` (F3D, SM64 flag word) | the microcode's pair store writes the flags of a vertex it computed from stale input | 242 |
+| a display list, vertices, matrix or light read from inside the RDP output ring; a matrix push into it (staged output) | the compare treats the bytes the RDP ignores (second words of syncs, slack) as don't care, a read gives them meaning | 243, 244 |
+| S2DEX `G_BG_1CYC` with a format past 4 or a texel size past 3, `G_BG_COPY` with a texel size past 3 | the table lookups read other DMEM | 94 (1CYC; its roles of the two bytes were swapped before) |
+| S2DEX `G_OBJ_LOADTXTR` with an object longer than its buffer or a tmem class byte that stores outside the two state words | the DMA / the store runs over the display list buffer and the jump table | 241, 247 |
+| an S2DEX opcode of 0x54 .. 0x7f (undefined): its jump table entry lies in the display list buffer (the table is at 0x370, the buffer at 0x418) | the microcode reads the entry from the list's own bytes when the command comes; the front-end classified it at the build's start | 310 |
+| a display list address that is not 8-aligned (`G_DL`, `G_BRANCH_Z`) | the refill DMA rounds down; the lean mode reads from the address | 240 |
+| `G_BRANCH_Z` of F3DEX2 2.04 / 2.04H compares the screen z (it compared the clip w, as F3DZEX does) | a vertex whose clip w and screen z differ | 259 |
+| `G_BRANCH_Z` of F3DEX 2.06 (`0bbe`) compares the screen z although the build has the F3DZEX triangle code (`bz_z`; derived from `zex` alone it compared the clip w) | a vertex whose clip w and screen z differ; the synthetic `misc` case found it (149 of 1000 seeds) | 317 |
+| any task once the JIT's SP_STATUS poll timeout has dropped from 0x7fff to 16 (parallel-rsp does that for good after the first task that polled for the CPU; Gauntlet Legends' display list branches to itself until the CPU patches it) | the JIT then halts every task at its 16th poll of a register and resumes it in the next call: the end state of the call is part of a task, and the front-ends run whole tasks (`hle_core.c`, `native_run`; all families) | 316 |
+
+Found by the same fuzzing and fixed (they are reachable by lists a game can write): the F3D triangle's `f3d_tri_in.sort_given` was never set (stack garbage decided whether the vertices were sorted by Indiana Jones' table: Wave Race and Pilotwings
+captures differed from the JIT in 5 to 9 of 24 tasks, nondeterministically; mutation 228), and the build constants of two F3DEX2 builds were wrong: Ocarina of Time's and Pokemon Snap's reject mask is 0x70b0 (the w lane), not 0x7030 (a triangle or `G_CULLDL`
+whose vertices share only bit 7 was drawn / not ended; 245), and F3DZEX's `G_BRANCH_Z` compares the integer part of the clip w (`lh 6(vertex)`), not the screen z (246).
+
+**Build switching (`G_LOAD_UCODE`).** The build record of the F3DEX2 front-end (`struct f3dex2_build`: the layout, the pcs of the handlers, the extension table, the overlay descriptors, the dead ranges) is a property of the
+*command loop*, not of the task: `f3_bind` (`hle_f3dex2.c`) sets it from the state of the microcode at a first command fetch, at the start of the task and after every `G_LOAD_UCODE`. What the microcode does (derived from its code; the
+stub at IMEM 0 is overlay 0, the same code that ends a task): it flushes the RDP buffer, saves the position in the display list (OSTask.data_ptr, DMEM 0xff0) and the text address (0xfd0, which the new microcode adds to its overlay
+descriptors), copies 3912 bytes of text to IMEM 0x80 and the data segment (the word of the `G_RDPHALF_1` before it, DMEM 0xd8, plus 0x180; the size is w0's low twelve bits) to DMEM 0x180 .., and starts the new text at 0x80, which
+initialises itself up to its first fetch. The front-end hands the command to the interpreter at 0xfac (the lean mode first puts the command's two words and the last 168-byte chunk of the list in the input buffer: the output buffers of the loaded
+microcode lie over it and the bytes behind its one-byte syncs are what it held), runs the loaded text's initialisation up to its first fetch (`head + 4` of the *new* build) and then calls `f3_bind` for the new build: the layout `f2L`, the opcode
+classification read from the jump table the data load put in DMEM, the overlay IMEM holds (S2DEX's initial text image has its overlay A resident), the pc a `G_ENDDL` hands over at, and `uc0`, the address of the running text. What is carried across is
+what that code does not write: DMEM below 0x180 (the F3DEX2 matrices and viewport, the RDP state words 0xc0 .. 0xd8, the FIFO pointer, the segment table, the display list stack and its depth, OSTask) and above the data, IMEM outside the text, the
+SP / DPC registers, RDRAM, and the count of SP_STATUS polls (the JIT halts a task at 32767 of them whichever microcode polls: `polls` goes on, plus the new text's first fetch). The new build is found by the FNV-1a-64 of the 3912 bytes the command
+copies (`f3dex2_build.load_key`; the ucode ids of the task starts are over `ucode_size` bytes and say nothing about a loaded text, which the DMA also copies only in part); the keys of the registered builds were taken from captured task
+starts (`tools/hle/` `armlet-native-replay` prints one in `HLE_F3_TRACE` for a text it does not know). A build that is not registered, or not of this front-end, declines the task as before.
+A task that switched builds is compared in two ways that differ from a plain one: the DMEM ranges that are dead are the *union* of the builds' (the table of the build a task starts with: the equivalence shim masks by it; Kirby 64's entry, the 2.04H
+text it shares with Super Smash Bros., carries S2DEX's two output buffers), and the RDP stream is compared with the three scratch bytes behind a one-byte sync zeroed as well (`hle_stream.hash_r`, `hle_task.switched`): the loaded build's buffers lie over DMEM
+that the build before it left in ranges it declares dead and does not keep exactly (the clipper's new vertices, the scratch of the triangle setup), and the RDP ignores those bytes.
+
+**Environment.** `ARMLET_HLE_VERIFY` (`1`, `jit`, `interp`), `ARMLET_HLE_EXACT` (the exact-events compare and the DMA-for-DMA front-end), `ARMLET_HLE_INTERP`, `ARMLET_HLE_STATS` (counts, decline reasons, time), `ARMLET_HLE_POISON`,
+`ARMLET_DMEM_POISON`, `ARMLET_HLE_ABORT`, `ARMLET_HLE_QUIET`, `HLE_FX2_SCALAR` (the scalar forms), `HLE_F3_PROF` (ticks per command kind, on stderr), `HLE_F3_TRACE` (every command and triangle), `HLE_F3_WATCH=<addr>` (a DMEM halfword,
+after every command that changes it), `HLE_DUMP_IMEM=<file>`, `HLE_DUMP_STREAM=<file>` (the native side's RDP stream), `HLE_DMEM_ALL` (list every differing DMEM byte), `HLE_RSP_TRIPC=<pc>` (the interpreter prints the three vertex slots at a triangle entry), `HLE_RSP_DEBUG=<n>` (the first n interpreted instructions), `HLE_RSP_TRACE` (every interpreted instruction with the vector register it wrote), `HLE_RSP_WATCH=<addr>` (every change of
+a DMEM byte, with the pc), `HLE_RSP_PROFILE` (executions per pc, `PROF pc count` lines on stderr at the end of every task).
+
+**Waits for the CPU (`PRSP_POLL_IDLE=N`, F3DEX2 front-end only, 2026-10-18).** Gauntlet Legends' display lists contain a `G_DL` branch to the command itself (`de010000 e0211b58` at 0x211b58): the microcode spins on it until the CPU patches the list.
+With the fork's policy on, the JIT cuts such a task after N polls of SP_STATUS in a row with the scalar registers unchanged, and the core resumes it in later calls (about 90 percent of Gauntlet's calls are such resumes). Without a path for them, a
+task starts natively, declines at the self-branching `G_DL`, and the JIT runs it and every call after it. What the JIT leaves at its cut (traced with a snapshot before and after every call, build `0bbe` = F3DEX fifo 2.06):
+
+- the poll is the delay slot of the `jal wait` at `head - 4` (`head`: `mfc0 at, SP_STATUS`), so the exit takes the branch: **pc = the wait routine** (0xfc8, `mfc0 t3, DMA_BUSY` loop; `jr ra`), **ra = head + 4** (0x190), no delay slot pending; SP_PC = `0x04001000 | pc`;
+- `at` = the status read by that poll (without HALT), `k0` = target + 168, `k1` = -168 (the refill that the `G_DL` made is done: the input buffer 0x920 .. 0x9c8 holds the list from the target), `t9` = w0, `t8` = the target, `s3` = 167, `s4` = 0x920, `t4` = w0 >> 24 (signed),
+  `v0`, `v1`, `t3` from the handler; SP_MEM_ADDR / SP_DRAM_ADDR / SP_RD_LEN = 0x9c8 / target + 168 / 0xff8; SP_STATUS = what it was (HALT is set by the cut and cleared again by `run_rsp_task`); DPC registers as the last flush left them;
+  the unflushed RDP output stays in its buffer (`s6 - 344 .. s7`);
+- the fork's tracker (`poll_idle`, `poll_last_sr`) ends at N idle polls with the registers of the cut; MFC0 counts are zeroed by the next call and never read.
+
+*The cut.* The loop meets a `G_DL` branch whose target is its own address (`f3_cut_dl`, where `f3_do_dl` used to decline): it hands the task to the interpreter at the `G_DL` handler, with the registers as the loop head leaves them for a handler, the way it does at the
+outermost `G_ENDDL`. The interpreter runs the microcode's own code (the handler, the refill, the DMA wait, the poll in the delay slot) and the fork's tracker, which it reaches through `hle_poll_status`, cuts it at the Nth idle poll exactly where the JIT is cut;
+`hle_rsp_run` then ends the call (`hle_cut`: the pc of the cut, HALT cleared, `K.cut`) instead of declining. So the registers the handler and the loop write, the DMA registers, the input buffer and the pc are the microcode's own, by construction.
+`native_run` accepts a call that ends in a cut as well as one that ends in BREAK (nothing else changed for the other families: they never set it), the commit replays the call's RDP lists and RDRAM writes and sets SP_PC as for a BREAK.
+
+*The call that continues.* dispatch (`armlet_gfx_try_native`) offers a call that starts at SP_PC != 0 to a family whose `wait_pc` says the pc is its wait routine (`f3_wait_pc`: the `jal` at `head - 4` and `mfc0 SP_STATUS` at `head` in IMEM), only with the policy on, and without the probe and the task counters.
+`f3_wait_state` checks that the registers are those of a wait on a `G_DL` to itself (ra, k1 = -168, the stale command in the input buffer is a `G_DL` branch with t9 = w0, t8 = target = k0 + k1, SIG0 clear: a yield request is declined). Then:
+*unchanged* (the 168 bytes at the target are the bytes in the input buffer): the JIT's idle slice (one stale iteration, N idle polls) refills the same bytes and leaves its state, except `at` = the status of its last poll and the fork's tracker, so the call sets those two and returns
+(`f3_idle`, before the framework's snapshot and commit: the SP_PC register gets the `0x04001000` that `run_rsp_task` gives it). *Patched*: the interpreter runs the wait routine and the stale command's iteration to the loop head (the refill brings the patched list; the registers are the JIT's, the tracker counts the poll),
+and the loop goes on from there as after the boot code of a fresh task, to the next wait (a cut again) or the BREAK. The exact-events mode (`ARMLET_HLE_EXACT=1`) runs the unchanged wait on the interpreter too, so that the recorded DMA sequence is the JIT's.
+
+*What a cut leaves that is not the JIT's.* The temporaries of the commands the front-end ran in place of the microcode: the scalar registers a0 .. a3, t0 .. t2, t5 .. t7, s0 .. s2, s5, sp, s8, the vector registers 2 .. 29, the accumulator, VCC / VCE and the divide unit. Verify compares the other scalar registers (`F3_CUT_SREGS`:
+at, v0, v1, t3, t4, s3, s4, s6, s7, t8, t9, k0, k1, gp, ra), the DMEM that is live at a cut though the table declares it dead (the input buffer, and the RDP output not flushed yet as a list of commands, without the words the RDP ignores), the DMA registers (the lean mode's flushes
+leave SP_WR_LEN, so a cut writes 0xff8 when it flushed), and the usual list. That the rest is dead is shown by poisoning it at every cut (`ARMLET_HLE_POISON=1 HLE_POISON_SEL=s=6027e7f0,v=3ffffffc,x=d`: those scalar registers, v2 .. v29, accumulator, divide unit, VCC and VCE; v0, v1, v30, v31 are the boot code's constants and
+VCO is 0 at the end of every command, `vadd` and `vsub` consume it: poisoning it changes the output at call 94 700 of Gauntlet): the hash stream, state, six screenshots and the audio equal the reference's over 3700 frames.
+
+*Measured* (Gauntlet Legends, 3700 frames, x86_64, `PRSP_POLL_IDLE=16`): 3583 of 3584 tasks native (was 207) and 1 193 958 of 1 194 703 continued calls (the 745 others have SIG0 set, a yield request, and go to the JIT); 1 047 476 of the calls are unchanged waits (the
+fast path takes 0.04 us in the front-end, 0.9 us the JIT's idle slice), 146 487 native runs end at a cut. The RSP time of the game is the video plugin's: the calls run it synchronously, 2.3 s of the 2.4 s per 1200 frames, so the saving shows as 4.5 percent
+(2424 -> 2315 ms per 1200 frames, three runs each) and the changed calls cost the same on both sides (240 us, mostly the RDP lists). Limits: the policy is the fork's, so the `ref` pairing sees the same cuts; a build with another loop head (`b->lay`, `b->pcs`: S2DEX, Rej, the
+other layouts) has no `wait_pc` and its tasks that wait decline as before; a wait that is not a `G_DL` to itself (another command that spins on the list) is not recognised and goes to the JIT; the lean front-end does not know the JIT would cut an ordinary task of more than N
+polls in a row with identical registers (N or more identical commands in a row; none seen in the 63 other games of the sets at 600 frames).
+
+**Dialects of the F3DEX2 front-end** (`hle_f3dex2_dialects.c`, `hle_s2dex2.c`, `hle_rej.c` (the Rej texts: extension commands for the vertex and triangle stage, `rej_fx.c` / `rej_dmem.h`, [ucode-rej.md](ucode-rej.md)), sharing `hle_f3dex2_int.h` with `hle_f3dex2.c`; the microcode semantics and the builds are in [ucode-f3dex2-dialects.md](ucode-f3dex2-dialects.md) and [ucode-s2dex2.md](ucode-s2dex2.md)). Builds
+that share the F3DEX2 skeleton (the display list refill, the DL stack, the RDP command copies, the flush) but differ in details are table entries of the same front-end, parameterised instead of copied:
+
+- **`struct f2_layout`** (`f3dex2_dmem.h`): the DMEM addresses the front-end uses, by name; the standard instance is what the four original builds share, a dialect that moved its state has one of its own, selected per task
+  (`f2L`, set by `f3dex2_run` from `f3dex2_build.lay`). The code reads `F2_GEOM` etc. through it, so the standard path costs a pointer load, not a copy of the code. The output buffer size (`out_bytes`: 344, 800 for S2DEX 2.06 / 2.08, 792 for
+  Ocarina of Time's S2DEX 2.05, F3DEXBG's 16) and `pipe_sync` (a flush entry that writes a `G_RDPPIPESYNC` in front of the buffer check: that S2DEX 2.05 [Safe]; `after_emit` in `hle_f3dex2_int.h` does it for every handler that emits) are fields of it.
+- **`struct f2_pcs`** and **`ext` / `ext_cmd`** (`f3dex2_build`): handlers below 0x170 at other pcs (S2DEX), and dialect commands (kinds from `K_EXT`) run by a hook that sees the whole per-task state (`struct f3`).
+  The hook does not test which build it runs: everything that differs between the S2DEX 2.08 / 2.06 / 2.05 texts is in the record, the handler table (`ext`: the 2.06 text's handlers from 0x184 on 8 bytes lower), the continuation pcs of
+  `G_OBJ_LOADTXTR` (`ldtx_spr`, `ldtx_rect`: where the table at DMEM 0x202 sends LDTX_SPRITE / LDTX_RECT), the layout (792-byte buffers and `pipe_sync` of the 2.05 [Safe] text, the overlay descriptors). So a derived S2DEX record runs with
+  the primary reference's hook (`dbuild_make`). The DMEM addresses of the S2DEX state (object buffers, render-mode tables, scissor fields) are the same in every 2.x text and stay constants of the front-end and the kernels: a text that moved
+  one does not align with the references at that instruction and its derivation is not EXACT / NEAR.
+  `G_TRI4` (F3DEXBG) is a command of the loop itself.
+- **`G_LOAD_UCODE`** (handler 0xfac in every build) switches the build the loop works with, in the middle of the task: see [Build switching](#build-switching-g_load_ucode) below. The same text is a re-initialisation (Conker ends every task this way);
+  the text of another registered build of this front-end is taken over (Kirby 64: F3DEX2 2.04H -> S2DEX 2.06 and back, in every task; Ocarina of Time: F3DZEX -> S2DEX 2.05 [Safe] and back, in every task that draws its
+  background); an unregistered text declines the task (F-Zero X's F3DLX.Rej and Resident Evil 2's F3DEX.Rej were such until the Rej front-end, [ucode-rej.md](ucode-rej.md); Excitebike 64's F3DEX.NoN xbus 2.08 likewise). The front-end remembers the text / data pointers of the tasks that declined at such a command
+  with the number of tasks that ran with them: when more than half of them declined, the next tasks with the same pair decline at once (every 64th runs again), else they run and the minority declines late (Resident Evil 2: 4267 of 6464
+  graphics tasks of 3700 frames are native; with the rule "one decline marks the pair" it was 69, because the pair is the same for the tasks that load and those that do not; mutation 306).
+- **`gen204`** (`f3dex2_build`): F3DEX2 2.04 / 2.04H, the generation before 2.05 (Buck Bumble, Cruis'n World, Super Smash Bros., Kirby 64): an unclamped screen z, another clipper reciprocal sign (`clip204`, a flag of its own: F3DEX 2.05 has the 2.04 reciprocal under the 2.06 vertex pipeline) and fan, a slip in the linear texture generation, and `G_BRANCH_Z`
+  that compares the screen z (the F3DZEX builds compare the integer part of the clip w). Two flags, four fields of the geometry structs (`fx2_vctx.gen204`, `fx2_clip_ctx.fan_l0` from `gen204`, `fx2_clip_ctx.sign0` from `clip204`; the registered builds have `clip204 == gen204`); the triangle setup is the existing `zex` parameter set
+  ([ucode-f3dex2-dialects.md](ucode-f3dex2-dialects.md) section 5).
+- **Overlays.** The S2DEX 2.x code overlays take the slots of the F3DEX2 clip / light overlays (`OV_CLIP` = A, `OV_LIGHT` = B); the end-of-task fix-up of the resident overlay is the same.
+- **Kernels.** Nothing in the production path is a transliteration of the microcode any more. The three routines that once were (S2DEX's sprite rectangle and background, F3DEXBG's lit vertices; `tools/rsp2c/rsp2c.py` made or drafted
+  them, one statement per instruction on the exact vector-unit library `tools/hle/ref_vu.h`) are closed forms: S2DEX `G_OBJ_RECTANGLE` in `s2dex2_rect.c`, `G_BG_1CYC` and `G_BG_COPY` in `s2dex2_bg.c` (sections 3a, 3b and 3c of
+  [ucode-s2dex2.md](ucode-s2dex2.md); shared DMEM access, saturation and constants in `s2dex2_int.h`) and the lighting stage of F3DEXBG in `f3dexbg_fx.[ch]` (a pass over the records of the standard vertex pipeline; DMEM adapters
+  and the whole command in `f3dexbg_dmem.h`; [ucode-f3dex2-dialects.md](ucode-f3dex2-dialects.md) 2.4). Plain C: the S2DEX ones work on two lanes (x and y) of a vector, and a NEON form that loads eight to use two
+  does not pay (the rectangle is about sixty integer operations; on x86 the closed form takes 0.4 times the old instruction-level kernel's time, section 3b). The lighting is a few 32-bit chains per vertex and light, and the
+  vertex pipeline under it is the NEON one; on aarch64 the pass itself is NEON too (`f3dexbg_fx_neon.h`: four vertices per vector, the lights shared; `fbg_lit_pass_scalar` stays the reference and the non-aarch64 form). On x86 the front-end runs at 1.6 to 3.4 times the JIT's speed (Worms tasks) and 3.4 to 3.9 (Conker's lit tasks), so lit vertices are native by default. A closed form declines (nothing written, the task
+  goes to the JIT) what its derivation does not cover: another set of vector constants, a scale of 0 or negative, a loop that would not end. `tools/rsp2c/rsp2c.py` stays as the generator of the references the closed forms are checked
+  against ([testing.md](testing.md), "Regenerating the microcode oracles"); the generated files are not part of the tree.
+- **Mutation numbers** (`MUT(n, ...)`, `scripts/build.sh native --tools --hmut=N`, `tools/hle/mutcheck_dialects.sh`): 30 to 39 and 44 the S2DEX front-end and the rectangle's tile/command part, 150 to 166 the rectangle closed form, 65 / 66 `G_TRI4` / `G_LOAD_UCODE`, 70 to 93 the background routine, 100 to 121 the F3DEXBG lighting, 40 to 60 the Rare front-end (`hle_rare.c`), 170 to 201 the Indiana Jones front-end (`hle_indy.c`), 210 to 216 the F3DEX2 2.04 / 2.04H differences and the two general fixes found with them (`f3dex2_fx.c`, `hle_f3dex2.c`; `tools/hle/mutcheck_204.sh`), 240 .. 259 the build switching and the declines found by fuzzing it (`hle_f3dex2.c`, `hle_s2dex2.c`), 260 to 299 `G_BG_COPY` (`s2dex2_bg.c`; `tools/hle/mutcheck_switch.sh`), 300 to 310 the S2DEX 2.05 [Safe] build, the load rule and a decline (`tools/hle/mutcheck_s206.sh`: 300 the sync byte, 301 its length, 302 the buffer size, 303 the sync flag of the layout, 304 the rectangle's continuation pc of `G_OBJ_LOADTXTR`, 306 the load rule, 308 / 309 a sync after a command that wrote nothing, 310 the undefined-opcode decline; 305 and 307 are free), 315 the `G_SELECT_DL` flags-word decline (`tools/hle/mutcheck_seldl.sh`; it replaced 311 and 312 when the two were merged; the branch `cmd-handoff` uses 300 to 314, so new numbers start at 316), 340 to 353 the probe on F3DEX2 records, 430 to 437 the latch policy (`latch.c`; `tools/hle/mutcheck_latch.sh`), 438 the command-kind gate, 439 the replay's compare of SP_STATUS, 440, 441, 443 a derived record changed after its probe passed (the validator must catch it), 442 the cache's keeping of an unlatch for good (`tools/hle/mutcheck_ucache.sh`), 444 the replay without the front-end lock (the TSan check), 400 to 403 the probe on S2DEX records (`tools/hle/mutcheck_probe_s2.sh`: 400 the continuation pc of LDTX_RECT, 401 the output buffer size, 402 the pipe sync, 403 the 2.06 handler shift); 500 to 517 the S2DEX 1.x kernels (`s2dex1_bgcopy.c` 500 .. 512, the rotated rectangle in `s2dex2_rect.c` 513 .. 517), 520 to 534 the S2DEX 1.x mode of the F3DEX 1.x front-end (`hle_s2dex1.h`), 540 to 561 the sprite (`s2dex1_sprite.c`; `tools/hle/mutcheck_s2dex1.sh`); the numbers are only live in the code of the family that runs, so a number may be used by two families (`tools/rare/mutcheck.sh` runs the Rare and Indiana Jones ones). `--gmut=N` is `F3D_FX_MUTATE` in the F3D struct-level functions (27 to 46 are the Rare and Indiana Jones paths).
+
+## The probe and the ucode cache
+
+On by default (`GfxProbe = on`, since 2026-10-17; `off` disables it); it needs `GfxMode = hle`, also the default. When it is on, a graphics task of a ucode that has no table entry makes arMLEt **derive** a build record for it from its text and **probe** the derived build against the JIT, while the JIT keeps running the game's real tasks (the "ubershader"). A pass is remembered in a file. What the probe does *not* do is decide to run the build for real: that is the latch policy, a validator on real tasks (next section); `ARMLET_PROBE_LATCH=1` latches a pass at once, for tests.
+
+**The derivation in C** (`derive.c`, `derive_int.h`, `derive_refs.c`; the method is [ucode-derive.md](ucode-derive.md), the C port is described there). First sight of a (text id, data id) pair: the 4 KiB text, the 8 KiB of RDRAM behind it (the lighting / S2DEX overlays) and the data segment are aligned with the references and the record comes out, with a verdict EXACT / NEAR / NONE; 1.2 to 1.6 ms for the F3DEX2 family on the x86 desktop (all families: 3 to 5 ms). Records come out for every family: the F3DEX2 family, S2DEX 2.x, F3DEX 1.x and F3D. The references are `derive_refs.c`, generated by `tools/derive_refs_gen.py` from the C tables and the dumps of the registered builds. **What it embeds:** no microcode text. Per instruction word of a reference a 16-bit index into a table of 64-bit one-way hashes of the instruction's *shape* (its word with the immediate, jump target or offset masked out; the whole word for instructions without such a field) and the 16-bit immediate; the build records; the jump table of each reference's data (handler pcs); the word indices of the handlers a reference has and a build may lack (`G_SPECIAL_1`, `G_TRI4`); the overlay geometry. A text can be *compared* with that, not recovered from it.
+
+**The probe** (`probe.c`, `probe_cases.c`, `dbuild.c`; the pair run is `armlet_hle_probe_pair` in `hle_core.c`). A derived F3DEX2 record becomes a `struct hle_ucode` + `f3dex2_build` + `f2_layout` + `f2_pcs` (`dbuild_make`: the dead ranges, flags and ring of the *primary reference's* registered entry are copied, not derived; an S2DEX record's dialect commands run on the primary reference's `ext_cmd`, its table and continuation pcs are the record's); a derived F3DEX 1.x record a `struct hle_ucode` + `f3dex1_build` + `f3dex_layout` (a handler pc may be 0 where no opcode of the text's own tables leads to the reference's handler: the command declines); a derived F3D record a `struct hle_ucode` + `f3d_build` + `f3d_layout` (the same rule for its pcs; the primary reference's dead ranges with G_VTX's return slot moved to the record's, the ring from the XBUS attribute, Wave Race's command sizes with its triangle code). On the next graphics tasks of that pair (4 canned tasks per task; `ARMLET_PROBE_STEP`) one canned task is run per step:
+
+1. The RSP state is saved (`prsp_native_save`: DMEM, IMEM, registers, vector unit, SP/DPC registers, MI_INTR, the status-poll bookkeeping, `dirty_blocks`).
+2. The canned task's world is a **private RDRAM**: an 8 MiB anonymous mapping of the probe's own (pages nobody writes cost nothing). The ucode's text with the 8 KiB behind it and its data segment are copied into it from the game's RDRAM at the addresses the OSTask names; the RDP ring (128 KiB), the canned data (`probe_cases.c`, 0x1200 bytes) and the matrix stack go to clear addresses near the top. The game's RDRAM is read, never written (`ARMLET_PROBE_CHECK=1` compares all of it before and after every canned task). For the JIT's DMA both `RSP::cpu`'s rdram pointer and `RSP::rsp.RDRAM` (which the sandbox's undo uses) are pointed at it for the length of the task (`probe_rdram.cpp`; the fork is unchanged). *The first version put the data into the tail of the game's RDP output ring and the undo wrote zeros over the game's RDRAM: Donkey Kong 64's audio diverged. The private RDRAM is why that cannot happen.*
+3. The OSTask in the saved DMEM is patched (display list, ring, matrix stack, no yield flag), the build's front-end runs the task in the sandbox (`native_run`), the state is put back, the **JIT** runs the same task from the same state, also in the sandbox (the RDP is not run, the writes are undone; the DPC registers are advanced as the video plugin does, `rdp_emul`), and the end states are compared as `ARMLET_HLE_VERIFY` does (DMEM except the build's dead ranges, IMEM, the SP/DPC registers, MI_INTR, the pc, the RDP list bytes as a stream, and the RDRAM written by DMA in the ring, the matrix stack and any other range the native run wrote).
+4. State, registers and `SP_PC` are put back (`prsp_native_load`, `prsp_native_resync`): the game's task then runs on the JIT as it would have. A canned task is *inconclusive* (not counted either way) when the XBUS is set, the JIT's status poll time-out has dropped (Gauntlet Legends: `native_run` declines then, too) or the JIT does not end the task.
+
+**The JIT's block cache.** The canned tasks run the game's own microcode text, so the blocks the JIT compiles for them are the blocks it compiles for the game's tasks (it keys them on the IMEM contents); the probe adds their compilation time (a few ms in all) earlier and, for overlay variants the game never loads, some blocks it would not have. `prsp_native_resync` drops the blocks and stubs that no longer match the restored IMEM. Evidence that nothing leaks: the state, hash, pictures and audio of the 3700-frame gates are identical with the probe on (testing.md).
+
+**The cases** (`probe_cases.c`, ported from `tools/hle/mksyn_ex2.py` and seeded with a PRNG of its own): `clip zneg tri mix wild misc lit mtx` (three seeds each) and two targeted cases of two variants each: `rej` (triangles entirely beyond one clipping plane, and `G_CULLDL` over them, each in a list of its own: the reject mask decides whether the list ends, so a wrong mask changes the RDP stream whatever the seed; the second variant has a negative w) and `bz` (`G_BRANCH_Z` against thresholds between the clip w and the screen z: a wrong `bz_z` changes the branch). 28 tasks, about 5 ms on the desktop. An F3DEX 1.x build gets the same eight random kinds and `rej` / `bz` encoded in the F3DEX 1.x GBI (`probe_case_make_f1`): the commands whose opcodes differ between the
+builds (RDPHALF, G_BRANCH_Z, G_MODIFYVTX, G_PERSPNORM, G_QUAD) take the opcode whose cell of the build's handler table leads to the record's pc, the others the GBI's numbers, G_CULLDL the record's form; its `rej`
+puts a witness RDP command behind every cull, and a triangle of three second-of-pair vertices with only bit 0x40 in common (NoN builds put the sign of w there): the NoN mask (0x7030) and the full one tell
+apart only there; `bz` is left out for a build without G_BRANCH_Z (28 or 26 tasks, 5 to 20 ms). An F3D build gets the eight random kinds and `rej` in Fast3D's GBI (`probe_case_make_f3`: G_VTX with the build's encoding
+(Wave Race's), G_TRI1 with its index scale and a flat-shading vertex 0 .. 2, the RDPHALF commands, G_PERSPNORMALIZE, Wave Race's quad and GoldenEye's G_TRI4 by the opcode whose table cell leads to the
+record's pc, at most 16 vertices per load inside the build's slots); its `rej` loads the plane groups in two halves of the 16 slots, culls each group in a list of its own with a witness behind it, adds the
+second-of-pair triangle for Pilotwings' sign of w and a group beyond the clip-ratio planes with w < 0 (only a G_CULLDL mask with those bits, SM64's 0xffff, ends that list); `lit` pops the matrix and draws
+again (G_POPMTX's stale flag). No `bz` (26 tasks, about 4 ms). An S2DEX 2.x build (a record with dialect commands) gets its own five cases instead, six seeds each (30 tasks, about 3.5 ms), `mksyn_ex2.py`'s `s2` stage split by command group:
+`s2rect` (sprite rectangles, tame and wild, render-mode changes), `s2ldtx` (texture loads, an object loaded twice, and an `LDTX_RECT` in every case: a wrong continuation pc declines them all), `s2bg` (`G_BG_1CYC`, overlay B, with sprites between: the
+overlay switches), `s2copy` (`G_BG_COPY`) and `s2misc` (`G_SELECT_DL` taken and not, `G_OBJ_MOVEMEM`, display list calls, `G_TEXRECT` + `G_RDPHALF_1 / _2`, other-mode, RDP copies, `G_SETSCISSOR`); each starts with segment 0, a scissor and a render mode.
+The backgrounds write 300 to 1500 bytes, so the flush of the output buffer (its size, the [Safe] sync in front of it) is in every seed. **Pass:** no task differs; at least 60 % of the tasks were conclusive; at least 75 % of the conclusive ones completed natively (a build that declines the rest is not the build); every case completed natively at least once, `rej` and `bz` in every variant.
+
+**Near-match tolerance.** None by default (`GfxProbeNear = strict`): a NEAR verdict is held to the same equality as an EXACT one. `tolerant` (`ARMLET_PROBE_NEAR=tolerant`) admits two things and nothing else, for NEAR derivations that differ in colour only: in the RDP stream, the **shade block** of shaded triangles (commands 0x0c .. 0x0f, bytes 32 .. 95) may differ by at most 2 colour levels in a channel's base value and 1/128 of a level per pixel step in a slope, the streams having the same length and every other byte equal (no command word, edge, texture or depth coefficient); in DMEM, the **colour word of a vertex record** (+0x10 .. +0x13 of the slots the build's vertex table names) by at most 2. A pass that needed the tolerance is `PASS (tolerant)`, cached as such. Geometry and wrong colours are never admitted. (Tested with mutations 350 .. 353: the perturbation inside the bounds passes tolerant and fails strict; outside, it fails both.)
+
+**XBUS (2026-10-18).** The three-set recount showed seven games refused as "not eligible" because their lists go through a DMEM ring (`DPC_STATUS.XBUS`) and the build had no `HLE_F_XBUS_OK`:
+the F3D ones (Mischief Makers, War Gods: the same 2.0H text) only lacked the flag, the front-end's `xbus_emit` had been there since the F3D work. The F3DEX2 ones (Ms. Pac-Man 2.08, Lode Runner
+3-D 2.07, Command & Conquer's F3DEX.NoN/L3DEX 2.06) differ from their fifo siblings in about 48 words at three places and nowhere else: the start-up (`mtc0` to DPC_STATUS and DPC_START, `addi
+s7, zero, ring_start`), the flush routine behind the `ed` handler (the room check and the `DPC_END` write instead of the fifo's DMA) and the exit code below 0x80. That is exactly Excitebike 64's
+loaded `f649` text (`l_b_ex2_208n_xbus`, `f2_layout.xbus`, `ring_start` 0xba8, `f3_flush_xbus`), which the front-end already ran but which was not a derivation reference. The F3DEX2 record now
+carries `xbus` (a flag, voted like `zex` / `gen204` / `clip204` over the words it owns: the three places above) and `ring_start` (a knob of the xbus references; under a fifo primary read from the
+start-up's `addi s7`), `dbuild_make` gives an xbus build `HLE_F_XBUS_OK` and no RDRAM ring, and the Rej work made `hle_rej.c`'s builds references, `f649` among them. The three texts derive EXACT /
+NEAR / NEAR with 0 unexplained words. Still without the transport: S2DEX xbus (StarCraft 64) and F3DEX 1.x xbus (a third of Glover's lists): their front-ends have no DMEM-ring flush.
+
+**The pair key: the static data signature (2026-10-18).** A pair was (text id, hash of the whole data image). Some games point `ucode_data` at a saved DMEM image that they rewrite every task
+(Twisted Edge: 1082 hashes in 1082 tasks, 114 bytes at 0x422 .. 0x57f; Gauntlet Legends: 256 images in 55 s, a 0xc00-byte image whose matrices, vertex table and input buffer change), so no
+pair ever got its canned tasks and the 16-pair table filled with the first 16 images. What the derivation reads of the image, and so what can change the record, is the jump table (the whole
+signed-opcode range) and the overlay descriptors (F3DEX2), or the two handler tables (F3DEX 1.x, F3D): a pair's key is now the **signature** of those bytes (`data_sig`, FNV over the ranges the
+record names), computed once the text's record is known. A task's image is matched to a pair by its whole-image hash first (the common case, remembered per pair) and otherwise by its signature
+under each pair of the text that has a record (`task_pair`); a new image of a known text joins its pair without a derivation, and a pair that derives to a signature another pair of the text
+already has is dropped. The cache is keyed by the signature too; the whole-image hash is still looked up first, so entries of texts whose image never changes are found as before. The
+derivation's own safety is unchanged: the probe and the validator judge the build, the signature only decides which tasks are the same pair.
+
+**First sight, in order:** cache lookup (hit with a pass: the build is made from the cached record at once, no canned task; hit with a failure or NONE: nothing more) - derivation (verdict NONE: logged, cached, no probe) - build (a record that cannot be made: unsupported, cached) - probe. Up to 16 pairs at a time. `ARMLET_PROBE_FORCE=1` probes the registered ucodes too, with their own record left out of the references (leave-one-out) and compares the derived record with the registered one, and treats them as unknown: their tasks run on the JIT until the derived build latches, then on the derived build for the data image it was derived for (`armlet_probe_gate`). **Loaded texts.** A text that a `G_LOAD_UCODE` loads in the middle of a task (S2DEX in Kirby 64's and Ocarina of Time's tasks) is never a task's own ucode. The front-end reports every load of another text (`armlet_probe_note_load`: the text address and the
+`G_RDPHALF_1` address, which is the image of DMEM 0, the command filling DMEM 0x180 .. from it); the next offer makes a pair of it keyed by its **load key** (the FNV of the 0xf48 bytes the command copies, the key `loaded_build` looks builds up by) and the data image, derives
+it with that image, and runs its canned tasks as tasks that start with that text (OSTask.ucode / ucode_data pointed at them). Its canned tasks run on whatever graphics task comes. A latched loaded build is registered with the load key as its id and
+`loaded_build` takes a latched build before the registered ones; it is not bound to the data image (`armlet_probe_gate` only sees task starts). Registered loaded texts are probed only with `ARMLET_PROBE_FORCE`.
+`ARMLET_PROBE_NONE_X=n` probes a NONE derivation that has at most n unexplained plus missing words (an experiment, never cached). `ARMLET_PROBE_FORCE_SELF=1` (with `ARMLET_PROBE_FORCE`, tests) keeps the registered build's own record among the references: the derivation is EXACT with the registered record, and the probe and the latch test the build that `dbuild_make` makes of it.
+
+**The cache** (`ucache.c`): one file, `armlet-ucode.cache` in the core's user config directory (`ConfigGetUserConfigPath`, so `--configdir` is respected; `$XDG_CONFIG_HOME/mupen64plus` or `~/.config/mupen64plus` when the core does not offer it), or the path of `GfxUcodeCache` / `ARMLET_UCODE_CACHE` (`off` for none). Entries are keyed by (text id, data id) and carry the tool version (the derivation's version, the file format and a checksum of the reference data: a new registered build or a changed derivation retires every entry), the derived record (format 5: the latch state; format 4: F3D records; format 3: F3DEX 1.x records; format 2: with an S2DEX record's dialect table), the verdict and the probe's counts and result, and the latch policy's state (latched / unlatched for good, the strikes, the evidence and distinct fingerprints, the validated command kinds, the real tasks equal and different). Each entry has a CRC-32 and a bad one is ignored; a truncated file keeps the entries before the cut; a damaged header makes the file empty; at most 512 entries (the oldest stored go first); writes go to a temporary file that is renamed over the cache, after merging in what another process wrote since the load; the merge and every store keep an unlatch for good (and the larger strike count) whoever wrote last, so no process can latch a build again that one unlatched. The cache has a mutex of its own: the validator thread stores the latch states while the emulation thread looks entries up (`ucache_get` copies an entry out).
+
+## The background validator and the latch policy
+
+Behind `GfxProbe = on` (nothing of it runs otherwise: the hooks below are one test of a NULL pointer per command, the capture hook one test per JIT task). A derived build whose probe passed is a
+**candidate**: it is registered (`armlet_hle_register_dynamic`) with a **gate** (`struct hle_gate`, `gate.h`) that keeps it from running, and the tasks of its (text, data) pair run on the JIT while
+the validator replays them through it. Enough evidence **latches** it: its tasks then run natively, under a per-command gate and a decaying sampling; a mismatch **suspends** it or **unlatches it for
+good**. The cache keeps the state across sessions. Code: `latch.c` (the policy, pure), `validate.c` (capture, queue, thread, replay), `probe.c` (the pairs' policy, `armlet_probe_gate`,
+`armlet_probe_declined`), `hle_core.c` (the detached replay, the gate hook, the front-end lock), `ucache.c`.
+
+**Capture (emulation thread).** `armlet_probe_gate` arms a capture for a task it sends to the JIT (`armlet_valid_arm`: only into a free slot of the bounded queue, `queue=` slots, default 4; no free slot:
+nothing is captured, counted as "not captured"). `HleForwardTask` calls `armlet_valid_jit_begin` / `_end` around the JIT run: begin saves the start state (`prsp_native_save`, with `pc` = `SP_PC`: the
+JIT's own pc field is still the last task's) and turns the fork's event recording on with a listener of its own (the `ARMLET_HLE_CAPTURE` mechanism): every SP DMA read stores the RDRAM rows it reads,
+as they are when read; every DMA write is noted; every `DPC_END` adds the list bytes to the task's RDP stream as the verify compare takes it (`hle_stream`, 1 MiB of bytes kept for the near-match
+tolerance, the hash always). End saves the end state; a task the JIT did not finish in one run (a yield, its poll time-out) is dropped; the rows the JIT wrote outside the RDP output ring get their
+bytes as the task left them. Caps (2 MiB of rows, 1 MiB written, 65536 writes) drop larger tasks. The slot then goes to the queue. Cost on the A53 (rg35xxsp): about 0.1 ms per captured task.
+
+**The detached replay (`hle_task.dx`, `struct hle_dx`).** The front-ends work on the memories and registers the task context points at; the few calls that touch the world are routed: `hle_mtc0`,
+`hle_dma_read` / `_write`, `hle_rdram_write`, `hle_poll_status`, `hle_break`, `hle_decline` and the interpreter (`hle_cpu_init`, `hle_rsp_run`: an `RSP::CPUState` of its own for the scalar registers
+and the vector unit, whose helpers take the state as an argument) work on the replay's DMEM, IMEM, 8 MiB RDRAM (an anonymous mapping holding the captured rows, the earliest read of an address
+winning; dropped with `MADV_DONTNEED` after each replay), SP / DPC registers, MI_INTR and poll counters. The SP register writes do what the fork's `RSP_MTC0` does (DMA rows, `SP_STATUS` set / clear
+bits and the interrupt, the semaphore, `DPC_START` / `END` / `STATUS`); a `DPC_END` takes the list as the video plugin does (`START = CURRENT = END`, as `hle_mtc0` leaves them for the commit). Nothing
+reaches the fork, the video plugin or the game's RDRAM, so the replay runs on any thread. The compare (`armlet_hle_dx_compare`) is the verify compare's external-effects mode: DMEM except the dead
+ranges, IMEM, the SP / DPC registers, MI_INTR, the pc, the poll time-out, the live scalar registers of `HLE_F_REGS_LIVE` builds, the RDP stream (with the build-switch rule), and RDRAM: every row the
+JIT wrote outside the ring must hold the same bytes in the replay, and every row the replay wrote outside the ring must be one the JIT wrote. A NEAR build is compared with the probe's near-match
+tolerance when `GfxProbeNear = tolerant` (the same definition: shade block and vertex colour, two levels). The replay does not touch the front-ends' cross-task bookkeeping (the G_LOAD_UCODE decline
+statistics, the probe's load notes). `ARMLET_VALID_DUMP=<dir>` writes a capture whose replay differed or declined as a task snapshot for `armlet-native-replay`.
+
+**Threading.** One validator thread at `SCHED_IDLE` (nice 19 where that is refused). arMLEt cannot see whether foir's workers are saturated, and does not need to: `SCHED_IDLE` gets a core only
+when nothing else wants one, which is the spare core when the workers are saturated and the workers' idle time when they are not, and it never takes time from the emulation thread or the video
+plugin. Slots move FREE -> ARMED -> CAPTURING -> QUEUED (emulation thread) -> RUNNING -> FREE (validator) through atomics, a semaphore wakes the thread; the emulation thread never waits for it (but for the front-end lock below).
+The front-ends' static state (the F3DEX2 layout pointer, the loaded-text cache, the F3DEX 1.x profile, the dialect buffers) is shared: a replay holds the **front-end lock**, which the emulation
+thread waits for at most 1 ms in `armlet_hle_run` (a replay is a few hundred us, and a task of a registered or latched build that met one is common: the replay of a loaded text is armed at the end of a task and the next task of the host build follows within a frame; the task goes to the JIT only when the wait times out, counted as "the validator held the front-end lock") and only tries in `armlet_probe_offer` (the derivation and the canned tasks wait for a later
+task). The policy's state is under a mutex of its own, written by the validator thread; the emulation thread reads atomics (`lstate`, the sampling interval, the gate's words). RomClosed /
+PluginShutdown stop the thread first (the replay in progress ends), then the pairs are stored and freed. A ThreadSanitizer build ran Donkey Kong 64 and Ocarina of Time without a report; with the
+replay's lock taken out (test build 444) it reports the race on the F3DEX2 layout pointer.
+
+**Fingerprint and evidence.** A replay counts the command kinds the build under validation ran (`hle_cmd` in each front-end's loop: the opcode byte, 0 .. 255), the risky paths taken
+(`LATCH_K_CLIP` a triangle went to the clipper, `LATCH_K_LIT` lit vertices, `LATCH_K_LOAD` a G_LOAD_UCODE of another text, `LATCH_K_CULLDL` a G_CULLDL that ended its list) and the
+**data situations** the F3DEX2, F3DEX 1.x and F3D code branches on (`latch.h`; `hle_vtx_kinds` after each G_VTX's transform, the triangle and clip paths): `LATCH_K_WNEG` a vertex with clip
+w <= 0 (at or behind the eye: computed from the clip coordinates, not from the flag word a wrong build computes), `LATCH_K_NEARCLIP` a clipped triangle with such a vertex (the near plane),
+`LATCH_K_TRI_REJECT` a triangle rejected (all vertices beyond one plane), `LATCH_K_TRI_CULL` culled or degenerate, `LATCH_K_BRZ` a G_BRANCH_Z taken, and `LATCH_K_VFLAG` + b for each bit b of
+the vertex clip-flag words a G_VTX produced (the x / y / z / w planes and the guard-band ratio planes: F3DEX2's high halfword is bits 16 .. 31). S2DEX has no geometry: its commands are
+gated by opcode only (its data-dependent paths, scissor clipping of sprites and background wrap, are left as opcodes; an open point). The **fingerprint** is
+the FNV of the kinds with their counts bucketed (1, 2-3, 4-7, ... 128+). A match adds **1 / (1 + earlier matches of its fingerprint)** of evidence, **at least `repeat` (0.05)**: repeats count
+little, variety counts fully, but a build whose tasks all look alike still moves (2026-10-18: before the floor the harmonic sum of 2000 repeats was 8.2, so such a build never reached 24; the
+distinct-fingerprint bar still holds it, unless the evidence reaches **`override` (4) times the base `evidence` (96, whatever the tier's multiplier) with at least 2 distinct fingerprints**: a loaded text's tasks, or a HUD's, are inherently
+uniform (NBA Jam 2000's loaded F3DLX.Rej: 2390 equal replays, 2 fingerprints), and hundreds of equal replays under the per-command gate are the stronger proof). An
+EXACT build **latches** at evidence >= `evidence` (24) **and** >= `distinct` (8) distinct fingerprints; a NEAR build (a NEAR derivation, or a probe pass that needed the tolerance) needs `near`
+(1.75) times both (42 and 14). Declined, inconclusive and loaded-text-not-loaded replays count neither way.
+
+**Per-command gate.** A latched build runs a task natively, but its loop declines the task (`hle_cmd`, the decline reason `hle_gate_why`) at the first command kind or risky path that was in no
+validated task; the JIT runs the task and the validator takes it (`armlet_probe_declined`), so the kind is validated by the next match. A decline costs the native work before it (the whole task
+goes back as for any decline).
+
+**Mismatch.** EXACT: the first mismatch **suspends** the build (back to a candidate, the JIT, evidence, fingerprints and kinds reset: which command was wrong is not known), the mismatch that makes
+`strikes` (2) strikes, this session's and the cache's, **unlatches it for good**. NEAR: a single mismatch unlatches it for good. An unlatch for good is stored at once and never retried (the build
+stays registered with its gate shut; a replay never takes it over).
+
+**Sampling.** A latched build's tasks are still validated: one in `sample` (32) runs on the JIT and is captured, the rate halving every `decay` (64) matches down to one in `sample_last` (256). It
+starts at one in 32 again in each session and after a suspension.
+
+**Registered builds** (the ucode id is a table entry) are not touched by any of this: with `GfxProbe = on` they run natively from their first task, nothing is derived, probed, validated or
+latched for them (`tools/equiv/check_direct.sh`). Only `ARMLET_PROBE_FORCE` makes them act unknown, for tests.
+
+**Loaded texts.** A derived build of a text that a G_LOAD_UCODE loads (S2DEX in Ocarina of Time and Kirby 64) is validated in the tasks of the build that loads it, and only when that build is
+registered or latched (never while it is itself a candidate): before it latches, a task that
+declines at the G_LOAD_UCODE (it runs on the JIT anyway) is captured with that build as the one under validation, and the replay runs the task's own build (a registered one, or a latched derived one)
+taking the candidate over at the load; in a replay any derived build that is not unlatched for good may be taken over (Ocarina of Time loads S2DEX and its own text back, both derived under
+`ARMLET_PROBE_FORCE`). A replay in which the candidate was not loaded counts as "without the build". Latched, it is sampled in the loading build's tasks at the same decaying rate. In a real run a
+derived text that is not latched is not taken over, and neither is a registered build in its place (`loaded_build`). **A replay notes loads too** (`armlet_probe_note_load` is thread-safe
+since 2026-10-17): a latched derived build whose tasks load an unknown text declines them at the gate in the real run before the load handler runs, so only the validator's replay ever reaches
+the load; without the note from there the loaded text was never derived and the tasks declined forever (NBA Jam 2000's F3DEX 2.05 loading its F3DLX.Rej 2.05; the text derives NONE, 38 % aligned,
+so those games wait for Rej as a derivation family, but the probe now sees it).
+
+**Cache.** Per (text, data): the record, the verdict, the probe's result as before, and the latch state, strikes, evidence summary, validated kinds and a session marker (`UCACHE_FORMAT` 5).
+Stored by the validator thread at a latch, a suspension and an unlatch, and by the emulation thread when a pair starts (the marker set) and at a clean close, RomClosed or PluginShutdown (the
+evidence and kinds of the session, the marker cleared). **Unclean end:** a pair whose entry still has the marker and was suspended (strikes, not latched) when the next session starts is unlatched
+for good: the session that used it ended without closing the ROM (a crash it may have caused). A pair latched in an earlier session starts native at once with
+its validated kinds, under the gate and the sampling; an unlatch for good is never retried.
+
+**Limits.** Validation is after the fact: a latched build that is wrong only in a situation that none of the kinds above tells apart from validated ones runs those tasks natively until a sampled
+one shows it, and the output differs meanwhile. Before the data kinds, test build 443 on Super Mario 64 (the clip-flag word of vertices behind the eye) did exactly that; with `LATCH_K_WNEG` the first
+such task declines and is validated (testing.md). A game whose scenes vary little (Kirby 64's intro: 3 fingerprints in 1800 tasks) does not latch.
+
+## The loose tier
+
+`GfxProbe = loose` (off by default; `on` is the default and is unchanged by any of this). A tier on top of the probe for texts the derivation calls **NONE but close**: the idea was a mode that
+does not match every ucode by hash but runs an approximate native build and accepts small differences; most of that was already the probe and the latch, and what was missing is this tier.
+Everything the strict tier does, it still does: registered builds run at once and are never derived, an EXACT or NEAR derivation is probed and latched as before, and the two tiers never see
+each other's cache entries.
+
+**Admission** (`probe.c`, `first_sight`). A derivation with the verdict NONE is admitted to the loose tier when its unexplained plus missing words are at most `GfxProbeLooseWords` (16), the
+family explains at least half of the image (the derivation's own floor: overlay slack, padding and reference features the text lacks are unaligned words too, so a text with 2 unexplained words
+can be 82 % aligned), and no constant was read two ways (`knob_trouble`). The verdict stays NONE; the pair is marked loose and everything about it goes to the loose section of the cache. A NONE
+text that is not admitted is marked as such in the loose section too, so it is not derived again. `ARMLET_PROBE_NONE_X` stays what it was: an uncached experiment.
+
+**The default-record arm** (the "generic handler" the idea asked for, without new kernels). A separate approximate handler is not worth building: the display-list decode *is* the ucode
+(opcodes, vertex layout, moveword / movemem indices differ per family), and RDP triangle setup must be bit-exact or it cracks and Z-fights, so the only parts that could be approximate
+(lighting, texgen) are already the tolerance's and are kernels shared across the families. What "generic" collapses to is the data-driven front-end with a **record the derivation made anyway**:
+`derive_run` always yields one (the handler pcs mapped by opcode through the text's own jump table, the layout knobs the aligned code confirms, the primary reference's for the rest) however
+many words it cannot explain; the verdict is about the words, not the record. So a NONE derivation **beyond** the word bound is admitted too when its family explains at least half of the image
+and no constant was read two ways, marked `default record` (cache flag `UC_FL_DEFAULT`), and the probe decides: another microcode fails every canned task (Blast Corps' F3D 2.0D `2f41`, 26 of
+26), a text that is a registered build with rewritten routines whose effect the canned tasks do not see passes, and latches at `default` (3) times the evidence (72 and 24) under the region
+gate (4 was tried first: Wipeout 64's L3DEX candidate had 1568 equal replays in 3700 frames and did not reach 32 distinct fingerprints; the multiplier buys variety before the first native
+task, the protection is the probe, the graded validator and the three refusal nets). `ARMLET_PROBE_DEFAULT=0` turns the arm off for an A/B.
+
+**The probe is as strict as for any other pair.** The canned tasks must come out equal (or within `GfxProbeNear = tolerant`'s tolerance). A text whose unexplained words change what a canned
+task does fails here and is cached as failed. Chameleon Twist 2's F3DEX 2.05 showed it: with 2 unexplained words in the clip overlay (the 2.04 flavour of the clipper's reciprocal under a 2.06
+vertex pipeline, which no record with one `gen204` flag expressed) it was admitted and failed 4 of its 28 canned tasks, all of the `clip` case, with a stream of another length, although it
+had verified clean in 3839 real tasks (the game's own lists do not reach that path). The right outcome: a difference in geometry is never admitted, whatever the tier. The text was then given
+what it needed in the strict tier, a clipper flag of its own (`clip204`, [ucode-f3dex2-dialects.md](ucode-f3dex2-dialects.md) section 7): it derives EXACT now and latches strictly.
+
+**The latch with graded mismatches** (`latch.c`, `latch_grade`, `latch_mismatch`; `hle_core.c`, `armlet_hle_dx_compare` with a `latch_diff`). A loose build needs `loose` (2.5) times the
+evidence and distinct fingerprints (60 and 20). The validator's compare classes every difference of a loose build's replay:
+
+- **HARD**: the task ended otherwise: SP_STATUS_TIMEOUT, the end pc, MI_INTR, a SP / DPC register or IMEM differ, or the build wrote RDRAM by DMA where the JIT wrote nothing. **Unlatched for
+  good at once.**
+- **NUMERIC**: every difference lies inside the loose tolerance: the shade block of shaded triangles by at most `GfxProbeLooseShade` (8) colour levels in a base value and 8/256 of a level per
+  pixel step in a slope, the streams of the same length and every other byte equal (the probe's `stream_tolerable` with a wider bound), or the colour word of a vertex record in DMEM by at most
+  8 levels. **Counted** (`numeric`, in the log and the cache), logged at INFO, **never a strike**; the build stays latched. This is the "tiny tint, not wrong colours" rule in code.
+- **STRUCTURAL**: anything else: a stream of another length or with another command word, edge, texture or depth coefficient, a DMA row with other bytes, DMEM state outside the colour words.
+  A strike, as for an EXACT build (suspended; the second unlatches for good). Wrong geometry is never kept.
+
+A strict build's mismatch is always STRUCTURAL (its behaviour is unchanged); the NEAR single-strike rule does not apply to a loose build that also needed the tolerance (the loose rules do).
+An unclean end (the session marker) with a *latched* loose build makes it a candidate again rather than unlatching it for good: a crash the build caused and a killed run (the coverage recount)
+cannot be told apart, and a loose build earning its evidence again is the cheaper mistake.
+
+**The region gate** (reading IMEM for features). The derivation reports its unexplained and missing words **by code region** (`derive_result.n_x_reg[]`, `n_xr_reg[]`: init, vertex,
+triangle, clip, light, other; `derive.c` has the reach sets of the F3DEX2 image, F3DEX 1.x and F3D count everything as "other"). A loose build whose light overlay has such words never admits
+`LATCH_K_LIT` (`latch_never`: a match does not add the kind, a suspension keeps the mask), one whose clip overlay has them never admits `LATCH_K_CLIP` / `LATCH_K_NEARCLIP`; the
+per-command gate then declines those tasks and the JIT runs them (and the validator takes them, as for any gate decline). The vertex, triangle and other regions have no kind of their own:
+there the graded validator is the only safety, and the log says so. The regions are stored in the cache entry (`xreg`). `ARMLET_PROBE_LOOSE_FORCE=clip,light` pretends those regions
+have unexplained words, for tests. (Chameleon Twist 2's two words were in the clip region: had its probe passed as a loose build, its clipped tasks would have stayed on the JIT; the strict
+`clip204` record runs them all.)
+
+**Cache.** `UCACHE_FORMAT` 6: the key is (text id, data id, **tier**). `ucache_find` / `ucache_get` look in the strict section; `ucache_find_t` / `ucache_get_t` take the tier; a store puts the
+entry in the section its `tier` names. A strict run never reads a loose entry, so a loose latch cannot weaken `tools/equiv`'s guarantees, and a loose run reads the strict section first (a
+text known as NONE there is looked up in the loose section, and derived again when that has nothing). Entries also carry `n_x` and the numeric count. The format bump retires the format-5 entries.
+
+**Tests.** `ARMLET_PROBE_LOOSE_FORCE=1` (with `GfxProbe = loose`) puts every derived pair in the loose tier whatever its verdict, so the loose latch path runs on a text that derives EXACT
+(with `ARMLET_PROBE_FORCE`, a registered one). Mutations 450 .. 453, 457 and 458 (`latch.c`), 454 (`ucache.c`), 456 and 459 (`probe.c`: the admission bound ignored; the default arm's family
+floor ignored; 455 is free); testing.md "The loose tier".
+
+**What it is for.** Inside the 64-ROM set no text gains from it today: the one NONE-but-close text (Chameleon Twist 2) failed the probe for a real reason and is a strict EXACT build since
+the `clip204` split, and the rest of the hot list is other microcode that needs kernels, not a looser gate (ucode-coverage.md). Its value is a retail text outside the set that is a registered build with a rewritten routine whose effect is a shade or
+colour rounding: it derives NONE, passes the probe, and runs with its small colour differences counted instead of unlatching.
+
+## Native handler contract (superseded)
+
+`armlet_gfx_try_native` still accepts a task only when `GfxMode = hle`; boot size <= 0x1000 (a task, not a bare RSP program); type 1; fresh (`SP_PC` 0 and the yield flag
+clear); its ucode id has a handler (an `hle_ucode` entry, see above) and the id is in `GfxHleUcodes` when that list is not empty. The handler `run` returns non-zero when it completed the
+task; returning 0 changes nothing and the JIT runs the task. What a completed task leaves is described in "Task-level native path"; the JIT stays the reference.

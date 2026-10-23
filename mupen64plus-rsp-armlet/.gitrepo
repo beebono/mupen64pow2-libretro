@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = https://github.com/beebono/mupen64plus-rsp-armlet.git
+	branch = devel
+	commit = d25604f4afce99a5d0ec63c2e109fbfbc17094d5
+	parent = 8d123490e33a681a5411cc9e0dfa610420799cc0
+	method = merge
+	cmdver = 0.4.9
