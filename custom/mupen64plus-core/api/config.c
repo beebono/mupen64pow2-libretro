@@ -427,6 +427,8 @@ static m64p_error write_configlist_file(void)
 
 m64p_error ConfigInit(const char *ConfigDirOverride, const char *DataDirOverride)
 {
+    /* No config file: the sections only live in memory, for the plugins */
+    l_ConfigInit = 1;
     return M64ERR_SUCCESS;
 }
 

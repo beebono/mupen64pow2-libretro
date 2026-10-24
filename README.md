@@ -1,3 +1,18 @@
+# Mupen64Plus-pow2
+
+A libretro N64 core built from Mupen64Plus-Next, reworked around the [mupen64plus-pow2](https://github.com/beebono/mupen64plus-pow2) stack for aarch64 handhelds. The output is `mupen64plus_pow2_libretro.so`.
+
+What changed from Mupen64Plus-Next:
+
+- **Core**: [mupen64plus-core-dento](https://github.com/beebono/mupen64plus-core-dento) (`libretro` branch: the Mupen64Plus-Next libretro patches on top of dento) replaces the libretro mupen64plus-core fork.
+- **Plugins**: only [foir](https://github.com/beebono/mupen64plus-rdp-foir) (software LLE RDP, NEON on aarch64) and [arMLEt](https://github.com/beebono/mupen64plus-rsp-armlet) (RSP: rsp-hle + parallel-rsp + native graphics microcode). GLideN64, angrylion, parallel-rdp, rsp-hle, cxd4 and parallel-rsp are gone, and with them all GL / Vulkan rendering.
+- **Vendoring**: the core and both plugins are git-subrepos with unmodified plugin sources; the libretro glue for the plugins is in `custom/pow2/` (symbol prefixes, core API lookups, foir's video output, options).
+- **Platforms**: Linux x86_64 / aarch64 and Android arm64-v8a / x86_64.
+
+The Mupen64Plus-Next README is kept below.
+
+---
+
 # Mupen64Plus-Next
 
 Mupen64Plus-Next is a N64 emulation library for the [libretro API](http://www.libretro.com/), based on Mupen64Plus (see below).

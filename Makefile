@@ -75,7 +75,7 @@ else ifeq ($(ARCH), $(filter $(ARCH), arm))
    WITH_DYNAREC = arm
 endif
 
-TARGET_NAME := mupen64plus_next
+TARGET_NAME := mupen64plus_pow2
 CC_AS ?= $(CC)
 NASM  ?= nasm
 
@@ -514,7 +514,6 @@ else ifneq (,$(findstring tvos,$(platform)))
 else ifneq (,$(findstring android,$(platform)))
    ANDROID = 1
    LDFLAGS += -shared -Wl,--version-script=$(LIBRETRO_DIR)/link.T -Wl,--no-undefined -Wl,--warn-common -llog
-   INCFLAGS += -I$(ROOT_DIR)/GLideN64/src/GLideNHQ/inc
    ifneq (,$(findstring x86,$(platform)))
       CC = i686-linux-android-gcc
       CXX = i686-linux-android-g++
@@ -699,7 +698,7 @@ $(TARGET): $(OBJECTS)
 ifeq ($(STATIC_LINKING), 1)
 	$(AR) rcs $@ $(OBJECTS)
 else
-	$(CXX) -o $@ $(OBJECTS) $(LDFLAGS) $(GL_LIB)
+	$(CXX) -o $@ $(OBJECTS) $(LDFLAGS) -ldl -lm
 endif
 
 # Script hackery fll or generating ASM include files for the new dynarec assembly code
@@ -715,9 +714,6 @@ $(AWK_DEST_DIR)/asm_defines_nasm.h: $(ASM_DEFINES_OBJ)
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(RSPDIR_PARALLEL)/lightning/lib/lightning.o: $(RSPDIR_PARALLEL)/lightning/lib/lightning.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DHAVE_MMAP=1 -c $< -o $@
 
 %.o: %.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
