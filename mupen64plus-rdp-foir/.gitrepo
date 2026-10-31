@@ -6,7 +6,7 @@
 [subrepo]
 	remote = https://github.com/beebono/mupen64plus-rdp-foir.git
 	branch = devel
-	commit = 044050ce81ddc485b77a9a97b8f01e1ae0c8987e
-	parent = 9c82f868a5aa29528fa393bde8b429ee52be635f
+	commit = 692f27c666425d7678252d176cdb729e96b532df
+	parent = be20a2089c3c9b381600f49f566ac916d5615cd4
 	method = merge
 	cmdver = 0.4.9

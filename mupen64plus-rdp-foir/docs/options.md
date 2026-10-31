@@ -18,9 +18,11 @@ foir reads its settings from the `[Video-Foir]` section of `mupen64plus.cfg` (wr
 | `Threads` | `0` | Rendering worker threads. `0` = auto (cores - 1: 3 on a 4-core chip; at most 7; one on a 2-core chip); `-1` = render on the emulation thread; `1`..`7` = that many. |
 | `FrameSkip` | `0` | `0` = off; `N` = render one frame in `N+1`; `auto` = skip when the achieved frame interval exceeds the VI period (see below). Skipped frames are still parsed (state, TMEM loads, syncs) but not rendered. |
 | `InterlaceHack` | `True` | For a buffer the game draws one field at a time and the VI scans out row by row, keep the freshest field's lines and interpolate the other lines from them, instead of weaving the stale ones in (see below). |
+| `DeferredDrain` | `True` | No drain at `SYNC_FULL`: the workers keep rendering behind the game until the core delivers the DP interrupt (core-dento's `FullSyncDelivered` hook; with `Core[RdpFullSyncDelay]` that is 600000+ cycles later) or the VI shows the buffer (then only the jobs writing the displayed buffer are waited for). Exact for a game that waits for its DP interrupt before touching the frame; a core without the hook gets the drain at the VI only. `FOIR_DEFER=0\|1` overrides. |
 | `SyncHelper` | `True` | The emulation thread renders pending stripe classes while it waits for the workers (`SYNC_FULL`, VI scan-out, hazard barriers, full job ring). Exact; `False` = it idles. |
 | `RelaxedPrecision` | `False` | `True` = depth compare of the opaque / transparent Z modes without the delta-Z terms for partially covered pixels; affects only coplanar edge cases and saves about 3 % of pixel-worker time ([measurement](performance.md#what-relaxedprecision-saves)). **Not exact when on.** |
 | `FastPerspective` | `False` | `True` = perspective-corrected texture coordinates from a float reciprocal instead of the RDP's table divide (sampling and mip-map LOD). No coordinate moves by a texel or more; in the captured 3D frames 0.2-1 % of the pixels change, by at most 33/255 per channel. Saves 3-6 % of a single-threaded frame on top of the exact divide ([measurement](performance.md#texture-coordinate-divide)). **Not exact when on.** |
+| `TextureLod` | `True` | `False` = no mip-mapping: every LOD-enabled state samples the finest level (tile 0) in both cycles and the LOD fraction reads 0, so the per-pixel LOD computation and the second level's fetch are skipped. Distant textures shimmer (the classic no-mipmap look); detail and sharpen modes are off with it. Saves 1.3-1.9 ms of a drawn VI in Banjo-Tooie and Mario Tennis on the rgdsplus, 1.5 ms on the rg35xxsp ([measurement](performance.md#what-texturelod-off-saves)). `FOIR_NOLOD=1` overrides. **Not exact when off.** |
 | `FastCombiner` | `True` | Use the NEON combiner and blender (exact). Off: the scalar reference combiner and blender. |
 | `NEON` | `True` | Use the NEON kernels when built in. `False` = scalar reference kernels (slow). |
 | `Specialize` | `True` | Use the precompiled per-state pixel kernel variants; `False` = the generic NEON kernels only (bit-identical output, slower). Needs `NEON`. |
@@ -69,10 +71,11 @@ Always available:
 | `FOIR_FILLDEDUP=0\|1` | Skip a FILL rectangle identical to one already drawn (same image, colour, rectangle and scissor) when nothing has written its bytes since (no overlapping primitive, same display list). Default `1`; exact. Pokemon Snap clears its Z buffer twice in a row every frame. |
 | `FOIR_NEON_MASK=bits` | Which stages use NEON, one bit each: texture 0x01, combine 0x02, zcmp 0x04, blend 0x08, store 0x10, fill 0x20, copy 0x40 (default `0x7f`). A stage that is not NEON is not specialised either; `0x3f` = everything but the NEON COPY kernel. |
 | `FOIR_NEON_VERIFY=1` | Run every NEON stage next to the scalar kernel and count mismatches; use with `FOIR_KNOBS=exact` ([testing.md](testing.md#in-plugin-verifier)). |
-| `FOIR_MT_STATS=1` | Print worker-pool counters (jobs, syncs, ring waits, helper tasks) when the plugin shuts down. |
+| `FOIR_MT_STATS=1` | Print worker-pool counters (jobs, syncs, ring waits, helper tasks) when the plugin shuts down; the same counters per 120 frames are in the log's periodic `mt:` line. |
+| `FOIR_SYNC_TRACE=N` | Print the first N barriers raised by a texture load or a render-target conflict to stderr: the byte range, the target region it hits with its rows, and the jobs pending at that moment. |
 | `FOIR_LOGFILE=path` | Also append the plugin's log lines to this file (unbuffered). |
 | `FOIR_DUMP=prefix`, `FOIR_DUMP_FRAME=n`, `FOIR_DUMP_FRAMES=k` | Capture RDP frames for `foir-replay` (first frame, default 200; number of frames, default 2). |
-| `FOIR_SHOT_DIR=dir`, `FOIR_SHOT_FRAMES=a,b,...` | Write `frame_NNNNN.ppm` screenshots at these plugin frame numbers (up to 64). |
+| `FOIR_SHOT_DIR=dir`, `FOIR_SHOT_FRAMES=a,b,...` | Write `frame_NNNNN.ppm` screenshots at these plugin frame numbers; an entry may be a range `a-b` or `a-b/step` (up to 4096 shots). |
 
 Only in debug builds (`CFLAGS=-DFOIR_STATS` or `-DFOIR_FRAMELOG`, see [testing.md](testing.md#debug-builds-and-logs)):
 

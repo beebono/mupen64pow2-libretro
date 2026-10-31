@@ -8,11 +8,13 @@ enum { FOIR_FRAMESKIP_AUTO = -1 };
 struct foir_config {
     bool fast_combiner;
     bool relaxed_precision;
+    bool no_lod;             /* TextureLod = False: mip-mapping off (tile 0 for both cycles, LOD fraction 0), not exact */
     bool fast_persp;         /* FastPerspective: float reciprocal instead of the table divide of perspective texture coordinates (not exact) */
     int  frame_skip;
     bool interlace_hack;
     int  threads;            /* 0 = auto */
     bool mt_helper;
+    bool defer_drain;        /* DeferredDrain: no drain at SYNC_FULL; the workers finish behind the game until the DP interrupt is delivered (the core's FullSyncDelivered hook) or the VI shows the buffer */
     bool specialize;
     bool neon;
     bool early_z;            /* batch-skip early Z (NEON kernels); FOIR_EARLYZ overrides */

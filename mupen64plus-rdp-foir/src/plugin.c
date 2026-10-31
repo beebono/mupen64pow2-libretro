@@ -25,9 +25,9 @@
 #include "gl_out.h"
 #include "capture.h"
 #include "foir_suxty.h"
+#include "mt.h"
 #ifdef FOIR_FRAMELOG
 #include "framelog.h"
-#include "mt.h"
 #endif
 #include <pthread.h>
 
@@ -155,11 +155,13 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void *context, voi
     ConfigOpenSection("Video-Foir", &l_cfg_foir);
     ConfigSetDefaultBool(l_cfg_foir, "FastCombiner", l_cfg.fast_combiner, "Fast paths for common combiner/blender modes (the NEON kernels always take them)");
     ConfigSetDefaultBool(l_cfg_foir, "RelaxedPrecision", l_cfg.relaxed_precision, "Forces lower accuracy depth values and calculations for speed");
+    ConfigSetDefaultBool(l_cfg_foir, "TextureLod", !l_cfg.no_lod, "Mip-mapping (RDP texture LOD). False = always the finest level, for speed (not exact; distant textures shimmer)");
     ConfigSetDefaultBool(l_cfg_foir, "FastPerspective", l_cfg.fast_persp, "Approximate perspective divide of texture coordinates, for speed (not exact)");
     ConfigSetDefaultString(l_cfg_foir, "FrameSkip", "0", "0 = off, N = fixed frame skip, auto = skip rendering to hold full speed");
     ConfigSetDefaultBool(l_cfg_foir, "InterlaceHack", l_cfg.interlace_hack, "Field-rendered buffers: keep the fresh field, interpolate the other lines, instead of weaving stale rows");
     ConfigSetDefaultInt(l_cfg_foir, "Threads", l_cfg.threads, "Number of rendering worker threads: 0 = auto (cores - 1), -1 = render on the emulation thread");
     ConfigSetDefaultBool(l_cfg_foir, "SyncHelper", l_cfg.mt_helper, "The emulation thread renders for the workers while it waits for them (exact)");
+    ConfigSetDefaultBool(l_cfg_foir, "DeferredDrain", l_cfg.defer_drain, "Keep rendering behind SYNC_FULL until the DP interrupt is delivered or the VI shows the buffer (exact for a game that waits for its DP interrupt; needs core-dento)");
     ConfigSetDefaultBool(l_cfg_foir, "Specialize", l_cfg.specialize, "Use the precompiled per-state pixel kernels; False = generic NEON kernels only (a stale JIT= entry in the config file is ignored)");
     ConfigSetDefaultBool(l_cfg_foir, "NEON", l_cfg.neon, "Use the NEON kernels when built in; False = scalar reference kernels");
     ConfigSetDefaultBool(l_cfg_foir, "VSync", l_cfg.vsync, "Wait for vertical sync when presenting");
@@ -208,9 +210,11 @@ static void read_foir_section(struct foir_config *c)
     c->fast_combiner = ConfigGetParamBool(l_cfg_foir, "FastCombiner") != 0;
     c->relaxed_precision = ConfigGetParamBool(l_cfg_foir, "RelaxedPrecision") != 0;
     c->fast_persp = ConfigGetParamBool(l_cfg_foir, "FastPerspective") != 0;
+    c->no_lod = ConfigGetParamBool(l_cfg_foir, "TextureLod") == 0;
     c->interlace_hack = ConfigGetParamBool(l_cfg_foir, "InterlaceHack") != 0;
     c->threads = ConfigGetParamInt(l_cfg_foir, "Threads");
     c->mt_helper = ConfigGetParamBool(l_cfg_foir, "SyncHelper") != 0;
+    c->defer_drain = ConfigGetParamBool(l_cfg_foir, "DeferredDrain") != 0;
     c->specialize = ConfigGetParamBool(l_cfg_foir, "Specialize") != 0;
     c->neon = ConfigGetParamBool(l_cfg_foir, "NEON") != 0;
     c->vsync = ConfigGetParamBool(l_cfg_foir, "VSync") != 0;
@@ -240,6 +244,10 @@ static void load_config(void)
     if (ne && *ne) l_cfg.neon = atoi(ne) != 0;
     const char *he = getenv("FOIR_HELPER");
     if (he && *he) l_cfg.mt_helper = atoi(he) != 0;
+    const char *nl = getenv("FOIR_NOLOD");
+    if (nl && *nl) l_cfg.no_lod = atoi(nl) != 0;
+    const char *dd = getenv("FOIR_DEFER");
+    if (dd && *dd) l_cfg.defer_drain = atoi(dd) != 0;
     const char *sl = getenv("FOIR_SKIPLOG");
     l_skiplog = sl && *sl && atoi(sl) != 0;
     l_cfg.skip_log = l_skiplog;
@@ -255,7 +263,7 @@ static void load_config(void)
     if (sg && *sg) l_cfg.skip_legacy = atoi(sg) != 0;
     const char *ke = getenv("FOIR_KNOBS");
     if (ke && !strcmp(ke, "exact")) {
-        l_cfg.relaxed_precision = false; l_cfg.fast_persp = false; l_cfg.frame_skip = 0; l_cfg.interlace_hack = false;
+        l_cfg.relaxed_precision = false; l_cfg.fast_persp = false; l_cfg.no_lod = false; l_cfg.frame_skip = 0; l_cfg.interlace_hack = false;
     }
 }
 
@@ -422,7 +430,11 @@ EXPORT void CALL UpdateScreen(void)
     struct vi_regs v;
     read_vi(&v);
     double ts = now_ms();
-    rdp_sync(&l_rdp);
+    if (l_rdp.cfg.defer_drain && l_rdp.mt) {              /* only the buffer the VI shows must be finished; the current frame renders on */
+        uint32_t lo, hi;
+        if (vi_scan_range(&v, &lo, &hi)) mt_wait_range(&l_rdp, lo, hi);
+    } else
+        mt_sync_frame(&l_rdp);
     double ts1 = now_ms();
     l_sync_ms += ts1 - ts;
     capture_frame(&l_rdp, &v);
@@ -477,6 +489,7 @@ EXPORT void CALL UpdateScreen(void)
                      (all - l_cpu_all_base) / 120, (emu - l_cpu_emu_base) / 120, (all - l_cpu_all_base - emu + l_cpu_emu_base) / 120);
             l_cpu_all_base = all; l_cpu_emu_base = emu;
         }
+        if (l_rdp.mt) foir_log(FOIR_LOG_INFO, "%s", mt_stats_delta(&l_rdp));
         {
             uint64_t cov[COV_N], texall;
             rdp_coverage(&l_rdp, cov, &texall);
@@ -533,6 +546,9 @@ EXPORT void CALL ReadScreen2(void *dest, int *width, int *height, int front)
     }
 }
 
+/* core-dento: just before a DP interrupt is delivered. The game is about to look at the frame: finish it (DeferredDrain) */
+EXPORT void CALL FullSyncDelivered(void) { if (l_rom_open) rdp_sync(&l_rdp); }
+
 EXPORT void CALL FBRead(unsigned int addr) { (void)addr; if (l_rom_open) rdp_sync(&l_rdp); }
 EXPORT void CALL FBWrite(unsigned int addr, unsigned int size) { (void)addr; (void)size; if (l_rom_open) { rdp_sync(&l_rdp); raster_mem_written(&l_rdp); } }
 EXPORT void CALL FBGetFrameBufferInfo(void *p) { (void)p; }
@@ -544,7 +560,7 @@ static const char *const l_lbl_threads[] = { "None", "Auto", "1", "2", "3", "4",
  * Threads + 1 (so -1 "None" = render on the emulation thread). */
 enum { OPT_WIDESCREEN, OPT_FILTER, OPT_INTERLACE, OPT_FRAMESKIP, OPT_VSYNC, OPT_THREADS, OPT_NEON, OPT_SPECIALIZE,
        OPT_FASTCOMB, OPT_RELAXED, OPT_CROP_H, OPT_CROP_V, OPT_VIAA, OPT_VIDIVOT, OPT_VIDEDITHER, OPT_VIGAMMA, OPT_FASTPERSP,
-       OPT_COUNT };
+       OPT_TEXLOD, OPT_COUNT };
 
 static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_WIDESCREEN] = { "Widescreen", "Widescreen", "Stretch to the whole screen instead of 4:3", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
@@ -564,6 +580,7 @@ static const struct foir_suxty_option l_opts[OPT_COUNT] = {
     [OPT_VIDEDITHER] = { "VIDedither", "VI Dither Restore", "Dither restore as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 0 },
     [OPT_VIGAMMA]    = { "VIGamma", "VI Gamma", "Gamma correction as the VI does, where the game uses it (costs time)", FOIR_OPT_BOOL, FOIR_OPTF_LIVE, 0, 1, 1, NULL, 1 },
     [OPT_FASTPERSP]  = { "FastPerspective", "Fast Perspective", "Approximate texture perspective divide, for speed (not exact)", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 0 },
+    [OPT_TEXLOD]     = { "TextureLod", "Texture LOD", "Mip-mapping; Off = finest level everywhere, for speed (distant textures shimmer)", FOIR_OPT_BOOL, 0, 0, 1, 1, NULL, 1 },
 };
 
 static bool l_staged_set[OPT_COUNT];
@@ -589,6 +606,7 @@ static int opt_load(const struct foir_config *c, unsigned i)
     case OPT_VIDEDITHER: return c->vi_dedither;
     case OPT_VIGAMMA:    return c->vi_gamma;
     case OPT_FASTPERSP:  return c->fast_persp;
+    case OPT_TEXLOD:     return !c->no_lod;
     }
     return 0;
 }
@@ -613,6 +631,7 @@ static void opt_store(struct foir_config *c, unsigned i, int v)
     case OPT_VIDEDITHER: c->vi_dedither = v != 0; break;
     case OPT_VIGAMMA:    c->vi_gamma = v != 0; break;
     case OPT_FASTPERSP:  c->fast_persp = v != 0; break;
+    case OPT_TEXLOD:     c->no_lod = v == 0; break;
     }
 }
 
