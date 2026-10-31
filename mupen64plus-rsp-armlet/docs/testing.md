@@ -398,6 +398,8 @@ overwrote the rows of the next task's start: replays of its small tasks differed
 **Replay harness: `HLE_PATCH`.** `armlet-native-replay` writes `HLE_PATCH=addr:hex;addr:hex` into RDRAM before the task (and `HLE_POKE` into DMEM): the synthetic display lists of `tools/hle/mksyn_ex2.py` (and `tools/f3d/mksyn.py`, whose runtime side this is) live at 0x300000; use `--oracle`. The snapshot supplies the
 microcode, its overlays (a base that never loaded the lighting overlay has none in its RDRAM image: the lit cases need a base with lit vertices, and a clipped one) and the start state.
 
+**G_MW_POINTS (gSPModifyVertex; Cruis'n USA, 2026-10-29).** The F3D front-end's `G_MOVEWORD` guard (mutation 238) admits index 0x0c offsets over the whole vertex buffer (the table entry must be the vertex base); the word store and the vertex-cache invalidation were already there. `tools/f3d/synth.sh` (now `--oracle`, snapshot `*-10` of a directory: the oracle does not finish the drawing cases from every captured start state) runs `mksyn.py mwpoints` (rgba, st, screen xy and z of a loaded vertex rewritten, two triangles) and `mwpoints-bad` (an offset into the 2.0D command buffer that rewrites a pending `G_TRI1`): SM64 2.0D snapshot: `nested`, `culldl`, `popmtx`, `mwpoints` equal, `mwpoints-bad` declined; with `--hmut=238` it runs and differs from the JIT (first byte of the stream). Cruis'n USA on the rgdsplus: the derived build latches after 40 tasks, per-VI p50 28.8 -> 17.5 ms, validator 0 differences, frames 150 / 1450 identical to the JIT run; desktop equivalence `ref` against `armlet`, 3700 frames, PASS (hash with the latched build's dead ranges as `EXTRA_MASKS`, state, 6 screenshots, audio).
+
 ## Fuzzing the front-ends (input no game produces)
 
 `tools/rsp2c/fuzz_snaps.py` writes perturbed copies of captured task snapshots (bytes of the display list, vertex and matrix rows flipped, words replaced by words of other commands); `armlet-native-replay --oracle` runs the front-end and
@@ -963,6 +965,15 @@ Gauntlet Legends (F3DEX fifo 2.06 `0bbe`): `G_DL` to itself, the JIT's idle cut,
 
 Development switches: `HLE_CUT_VR=1` prints the vector registers, flags, accumulator and divide unit that differ at each cut in verify (not part of the result), `HLE_CUT_SREG_ALL=1` reports every scalar register that differs, `HLE_POISON_SEL` `x=8` is VCC and VCE only. Mutation numbers 481 to 487 are this feature's.
 
+
+2026-10-29, the per-call cost on the rgdsplus (613 calls per frame): a continuing call reuses the task's identity (no 4 KiB memcmp), `armlet_hle_find` caches its last hit, the F3DEX2 development switches are read once: 36.2 -> 33.2 ms per VI, screenshots identical, equivalence `ref` against `armlet` 3700 frames PASS (hash, state, 6 shots, audio; `scripts/build.sh ref native` first: a `ref` pairing built before the idle-poll policy cuts elsewhere and differs from call 21). The rest of the game's gain is the core's `Core[RspResumeDelay]` (mupen64plus-pow2 README): 31.3 -> 20.5 us per primitive on the bundle.
+
+Yields (same day, a camera-pan state of the level hub): 1314 of 4033 continued calls declined "the task yields" and every resumed task ran on the JIT (27 % of the thread). With the yield request and the yielded resume native (design.md "Yields"): 0 declined, 2752 tasks (every resume counts as one) all native; `ARMLET_HLE_VERIFY=1` from the state, 550 frames: 3216 tasks compared, 0 with differences; frame 1450 identical to the JIT-path run; 28.9 -> 25.6 ms per VI, 20.8 -> 18.5 us per primitive (so stack). Equivalence `ref` against `armlet`: Gauntlet 3700 frames (745 yields) and Banjo-Tooie, Paper Mario, Donkey Kong 64, Pokemon Snap 600 frames each: PASS (hash, state, 6 shots, audio).
+
+The vertex path (same day; design.md, the F3DEX2 front-end): the block form of `fx2_vtx_xform` and the lane-reversal record accessors. `tools/hle/test_fx2.c` 20 000 vertex batches 0 differences (it caught the first
+version's guard-band flags for ratios over 0x7fff); desktop equivalence (scalar forms) of the five games above against the stored `ref` outputs PASS; on the rgdsplus the old and the new plugin on Gauntlet (pan state, 300 frames),
+Banjo-Tooie, Paper Mario, Donkey Kong 64 and Mario Tennis (150 .. 400): RSP hash streams identical, screenshots identical. Frame times (rrd2 core, .so stack, 1300 VI): pan 26.44 -> 25.39 ms per VI, hub 26.22 -> 25.20, peak
+18.60 -> 18.23 (the kernel alone was 1 .. 2.5 percent: most of Gauntlet's G_VTX commands load one vertex, so the per-command cost rules: 1.37 us per G_VTX before, `HLE_F3_PROF`).
 
 ## S2DEX 1.x (2026-10-18; docs/ucode-s2dex1.md)
 

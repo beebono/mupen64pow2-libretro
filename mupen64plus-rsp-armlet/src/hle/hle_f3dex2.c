@@ -27,7 +27,7 @@
 #ifdef ARMLET_NATIVE
 
 /* development: HLE_F3_PROF=1 sums the time of each command kind over all tasks and prints it at exit */
-static uint64_t g_pt[40], g_pn[40];
+static uint64_t g_pt[40], g_pn[40], g_pvn[33];     /* (g_pvn: G_VTX commands by vertex count) */
 static int g_prof = -1;
 static inline uint64_t ticks(void)
 {
@@ -48,6 +48,11 @@ static void prof_dump(void)
     for (k = 0; k < 27; k++)
         if (g_pn[k])
             fprintf(stderr, "PROF %-9s n=%-9llu ticks=%-12llu per=%.1f\n", nm[k], (unsigned long long)g_pn[k], (unsigned long long)g_pt[k], (double)g_pt[k] / g_pn[k]);
+    fprintf(stderr, "PROF vtx counts:");
+    for (k = 1; k <= 32; k++)
+        if (g_pvn[k])
+            fprintf(stderr, " %u:%llu", k, (unsigned long long)g_pvn[k]);
+    fprintf(stderr, "\n");
 }
 
 /* ---- the builds ------------------------------------------------------------------------------------------------------------------------------------------------------------------ */
@@ -721,6 +726,12 @@ static int f3_resume(struct hle_task *t, const struct f3dex2_build *b, struct hl
     int rc;
     if (prsp_poll_idle_limit() <= 0)
         return hle_decline(t, "the idle-poll policy is off");
+    if (*t->cr[4] & SIG0) {
+        /* a yield request (SIG0): the microcode's own code from the wait routine on, interpreted to its BREAK: the poll at the loop head, the exit code's flush and the yield save
+         * (the JIT ran the same ~200 instructions; what it saved the resumed task restores natively, dispatch.c) */
+        c->stop_pc = 0x1000;
+        return hle_rsp_run(t, c);
+    }
     why = f3_wait_state(t, b, c->r, &target);
     if (why)
         return hle_decline(t, why);
@@ -1013,6 +1024,8 @@ static int run_loop(struct f3 *f, int *handover)
         if (g_prof) {
             g_pt[kd] += ticks() - t_cmd;
             g_pn[kd]++;
+            if (kd == K_VTX)
+                g_pvn[((w0 >> 12) & 0xff) < 33 ? (w0 >> 12) & 0xff : 0]++;
         }
         if (f->watch >= 0 && hle_dm16(t, f->watch) != f->wval) {
             f->wval = hle_dm16(t, f->watch);
@@ -1153,9 +1166,11 @@ static int f3dex2_run(struct hle_task *t, const struct hle_ucode *u)
     c.stop_pc = b->head + 4;                            /* the first fetch has polled SP_STATUS already */
     rc = t->start_pc ? f3_resume(t, b, &c) : hle_rsp_run(t, &c);
     if (rc != HLE_STOP)
-        return rc;                                      /* the task ended before the loop, or declined (a call that continues a task: ended at the cut again) */
-    if (*t->cr[4] & SIG0)
-        return hle_decline(t, "the task yields");
+        return rc;                                      /* the task ended before the loop, or declined (a call that continues a task: ended at the cut again, or yielded) */
+    if (*t->cr[4] & SIG0) {                             /* a yield request at the first fetch: the microcode's own code from the loop head, interpreted to its BREAK */
+        c.stop_pc = 0x1000;
+        return hle_rsp_run(t, &c);
+    }
     memset(&f, 0, sizeof(f));
     f.t = t;
     f.k0 = c.r[HLE_REG_K0];
@@ -1163,10 +1178,20 @@ static int f3dex2_run(struct hle_task *t, const struct hle_ucode *u)
     f.s6 = c.r[HLE_REG_S6];
     f.s7 = c.r[HLE_REG_S7];
     f.polls = 1;
-    f.trace = getenv("HLE_F3_TRACE") != NULL;
+    {   /* (the development switches, read once: a getenv per call was 1.7 % of the emulation thread in Gauntlet Legends) */
+        static int dev_init, dev_trace, dev_watch, dev_dump;
+        if (!dev_init) {
+            dev_init = 1;
+            dev_trace = getenv("HLE_F3_TRACE") != NULL;
+            dev_watch = getenv("HLE_F3_WATCH") ? (int)strtoul(getenv("HLE_F3_WATCH"), NULL, 16) : -1;
+            dev_dump = getenv("HLE_DUMP_IMEM") != NULL;
+        }
+        f.trace = dev_trace;
+        f.watch = dev_watch;
+        f.dump_imem = dev_dump;
+    }
     if (f.trace)
         fprintf(stderr, "START k0=%08x k1=%08x s6=%04x s7=%04x\n", f.k0, f.k1, f.s6, f.s7);
-    f.watch = getenv("HLE_F3_WATCH") ? (int)strtoul(getenv("HLE_F3_WATCH"), NULL, 16) : -1;
     f.wval = f.watch >= 0 ? hle_dm16(t, f.watch) : 0;
     f.total = 0;
     f.lean = !hle_exact();
@@ -1176,7 +1201,7 @@ static int f3dex2_run(struct hle_task *t, const struct hle_ucode *u)
         rc = run_loop(&f, &handover);
         if (rc != HLE_OK)
             return rc;
-        if (getenv("HLE_DUMP_IMEM")) {                  /* (one file per hand-over: <file>, <file>.1, ...) */
+        if (f.dump_imem) {                              /* (one file per hand-over: <file>, <file>.1, ...) */
             static unsigned dumps;
             char nm[512];
             FILE *fp;
@@ -1214,8 +1239,10 @@ static int f3dex2_run(struct hle_task *t, const struct hle_ucode *u)
         rc = hle_rsp_run(t, &c);
         if (rc != HLE_STOP)
             return rc;
-        if (*t->cr[4] & SIG0)
-            return hle_decline(t, "the task yields");
+        if (*t->cr[4] & SIG0) {
+            c.stop_pc = 0x1000;
+            return hle_rsp_run(t, &c);
+        }
         handover = 0;
         f.k0 = c.r[HLE_REG_K0];
         f.k1 = c.r[HLE_REG_K1];
@@ -1252,7 +1279,7 @@ static int f3dex2_run(struct hle_task *t, const struct hle_ucode *u)
     return rc;
 }
 
-const struct hle_family f3dex2_fam = { .name = "f3dex2", .run = f3dex2_run, .wait_pc = f3_wait_pc, .idle = f3_idle };
+const struct hle_family f3dex2_fam = { .name = "f3dex2", .run = f3dex2_run, .wait_pc = f3_wait_pc, .idle = f3_idle, .yield_ok = 1 };
 
 static const struct f3dex2_build l_b_dk64 = {
     .head = 0x18c, .copy = 0x208, .sync = 0x20c, .segcopy = 0x218, .ef = 0x238, .ed = 0x244, .tri1 = 0x7b4, .tri2 = 0x7ac, .vtx = 0x4f0,

@@ -115,15 +115,28 @@ const struct hle_ucode *armlet_hle_next(const struct hle_ucode *prev)
 
 const struct hle_ucode *armlet_hle_find(uint64_t id)
 {
+    static uint64_t last_id;                            /* the last hit (a call per RSP call: 613 per frame in Gauntlet Legends) */
+    static const struct hle_ucode *last;
+    static unsigned last_ndyn;
     const struct hle_ucode *const *p;
     unsigned i;
+    if (last && last_id == id && last_ndyn == g_ndyn)
+        return last;
     for (i = 0; i < g_ndyn; i++)
         if (g_dyn[i]->id == id)
-            return g_dyn[i];
+            goto found;
     for (p = __start_hle_ucodes; p < __stop_hle_ucodes; p++)
-        if (*p && (*p)->id == id)
-            return *p;
+        if (*p && (*p)->id == id) {
+            last = *p;
+            goto done;
+        }
     return NULL;
+found:
+    last = g_dyn[i];
+done:
+    last_id = id;
+    last_ndyn = g_ndyn;
+    return last;
 }
 
 const struct hle_ucode *armlet_hle_find_registered(uint64_t id)
@@ -1136,6 +1149,8 @@ static int hle_run_locked(struct armlet_ctx *c, const struct hle_ucode *uc)
         if (!wp || wp != (*c->rsp.SP_PC_REG & 0xfff))     /* (not a call the family can take up: the JIT's, uncounted) */
             return 0;
         K.resumes++;
+    } else if ((armlet_dmem32(c, ARMLET_TASK_FLAGS) & 1) && !uc->fam->yield_ok) {
+        return 0;                                       /* (a yielded task resumed, a family without the path: the JIT's, uncounted) */
     } else {
         K.tasks++;
         if (!(K.tasks & 63))

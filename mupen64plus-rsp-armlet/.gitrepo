@@ -6,7 +6,7 @@
 [subrepo]
 	remote = https://github.com/beebono/mupen64plus-rsp-armlet.git
 	branch = devel
-	commit = d25604f4afce99a5d0ec63c2e109fbfbc17094d5
-	parent = 8d123490e33a681a5411cc9e0dfa610420799cc0
+	commit = b6fbbc4a2e4be5c97df2e0fb74de6b3ab1210bdd
+	parent = 142dc6d9d188f7f25848f541a5138b93cfc48da5
 	method = merge
 	cmdver = 0.4.9
