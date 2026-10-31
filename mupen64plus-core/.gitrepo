@@ -6,7 +6,7 @@
 [subrepo]
 	remote = https://github.com/beebono/mupen64plus-core-dento.git
 	branch = libretro
-	commit = d9337a886125c8cdf3e55ff618f8aa5c88b20d31
-	parent = 06d689baee8eb3cfb11dc9305f7c1b1c17799bc6
+	commit = 236f0127ab6dca172d81def5ccce021596080292
+	parent = 2041043bbf6d31619da946a9ded243441b539e9d
 	method = merge
 	cmdver = 0.4.9
