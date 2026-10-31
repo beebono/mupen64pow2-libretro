@@ -18,6 +18,7 @@
 #define ReadScreen2 foir_ReadScreen2
 #define SetRenderingCallback foir_SetRenderingCallback
 #define ResizeVideoOutput foir_ResizeVideoOutput
+#define FullSyncDelivered foir_FullSyncDelivered
 #define FBRead foir_FBRead
 #define FBWrite foir_FBWrite
 #define FBGetFrameBufferInfo foir_FBGetFrameBufferInfo
